@@ -1,11 +1,11 @@
 ##
 # Author: Konrad Zemek
 # Copyright (C) 2015 ACK CYFRONET AGH
-# This software is released under the MIT license cited in 'LICENSE.txt'
+# This software is released under the MIT license cited in 'LICENSE.md'
 #
 
-cmake_minimum_required(VERSION 3.0.0)
-project(erlang_tls C CXX)
+cmake_minimum_required(VERSION 3.1.0)
+project(etls C CXX)
 
 set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY True)
 set(CMAKE_POSITION_INDEPENDENT_CODE True)
@@ -30,22 +30,23 @@ if(APPLE)
         "${CMAKE_SHARED_LIBRARY_CREATE_CXX_FLAGS} -flat_namespace -undefined dynamic_lookup")
 endif(APPLE)
 
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED On)
 add_compile_options(-Wall -Wshadow -Wpedantic)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
+add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden)
 add_definitions(-DASIO_STANDALONE)
 
 enable_testing()
 add_subdirectory(src)
 add_subdirectory(test EXCLUDE_FROM_ALL)
 
-add_library(erlang_tls SHARED src/wrapper.cpp ${PROJECT_SOURCES})
-target_link_libraries(erlang_tls PRIVATE
-    ${ERLANG_TLS_LIBRARIES})
-target_include_directories(erlang_tls SYSTEM PRIVATE
+add_library(etls SHARED src/wrapper.cpp ${PROJECT_SOURCES})
+target_link_libraries(etls PRIVATE ${ETLS_LIBRARIES})
+target_include_directories(etls SYSTEM PRIVATE
     ${ERLANG_ERTS_INCLUDE_PATH}
-    ${ERLANG_TLS_SYSTEM_INCLUDE_DIRS})
-target_include_directories(erlang_tls PRIVATE
-    ${ERLANG_TLS_INCLUDE_DIRS})
-set_target_properties(erlang_tls PROPERTIES SUFFIX .so)
+    ${ETLS_SYSTEM_INCLUDE_DIRS})
+target_include_directories(etls PRIVATE
+    ${ETLS_INCLUDE_DIRS})
+set_target_properties(etls PROPERTIES SUFFIX .so)
 
-install(TARGETS erlang_tls DESTINATION .)
+install(TARGETS etls DESTINATION .)
