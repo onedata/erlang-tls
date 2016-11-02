@@ -129,6 +129,9 @@ $0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
 push(@INC,"${dir}","${dir}../../perlasm");
 require "x86asm.pl";
 
+$output=pop;
+open STDOUT,">$output";
+
 &asm_init($ARGV[0],"ghash-x86.pl",$x86only = $ARGV[$#ARGV] eq "386");
 
 $sse2=0;
@@ -358,7 +361,7 @@ $S=12;		# shift factor for rem_4bit
 # effective address calculation and finally merge of value to Z.hi.
 # Reference to rem_4bit is scheduled so late that I had to >>4
 # rem_4bit elements. This resulted in 20-45% procent improvement
-# on contemporary µ-archs.
+# on contemporary Âµ-archs.
 {
     my $cnt;
     my $rem_4bit = "eax";
@@ -1368,6 +1371,8 @@ my ($Xhi,$Xi)=@_;
 
 &asciz("GHASH for x86, CRYPTOGAMS by <appro\@openssl.org>");
 &asm_finish();
+
+close STDOUT;
 
 # A question was risen about choice of vanilla MMX. Or rather why wasn't
 # SSE2 chosen instead? In addition to the fact that MMX runs on legacy

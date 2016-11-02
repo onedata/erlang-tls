@@ -3,7 +3,7 @@
  * @author Konrad Zemek
  * @copyright (C) 2015 ACK CYFRONET AGH
  * @copyright This software is released under the MIT license cited in
- * 'LICENSE.txt'
+ * 'LICENSE.md'
  */
 
 #include "detail.hpp"
@@ -11,6 +11,7 @@
 #include <asio/ssl/context.hpp>
 #include <asio/ssl/rfc2818_verification.hpp>
 
+#include <cassert>
 #include <memory>
 
 namespace {
@@ -32,15 +33,15 @@ namespace detail {
 WithSSLContext::WithSSLContext(const asio::ssl::context_base::method method,
     const std::string &certPath, const std::string &keyPath,
     std::string rfc2818Hostname)
-    : m_context{method}
+    : m_context{std::make_shared<asio::ssl::context>(method)}
 {
-    m_context.set_options(asio::ssl::context::default_workarounds);
-    m_context.set_default_verify_paths();
-    m_context.set_verify_depth(100);
+    m_context->set_options(asio::ssl::context::default_workarounds);
+    m_context->set_default_verify_paths();
+    m_context->set_verify_depth(100);
 
     if (!certPath.empty()) {
-        m_context.use_certificate_chain_file(certPath);
-        m_context.use_private_key_file(keyPath, asio::ssl::context::pem);
+        m_context->use_certificate_chain_file(certPath);
+        m_context->use_private_key_file(keyPath, asio::ssl::context::pem);
     }
 
     std::unique_ptr<X509_VERIFY_PARAM, decltype(&X509_VERIFY_PARAM_free)> param{
@@ -50,26 +51,30 @@ WithSSLContext::WithSSLContext(const asio::ssl::context_base::method method,
 
     X509_VERIFY_PARAM_set_flags(
         param.get(), X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
-    SSL_CTX_set1_param(m_context.native_handle(), param.get());
+    SSL_CTX_set1_param(m_context->native_handle(), param.get());
 
     X509_STORE_set_flags(
-        m_context.native_handle()->cert_store, X509_V_FLAG_ALLOW_PROXY_CERTS);
+        m_context->native_handle()->cert_store, X509_V_FLAG_ALLOW_PROXY_CERTS);
 
-    m_context.set_verify_callback(
-        [ this, rfc2818Hostname = std::move(rfc2818Hostname) ](
-            auto preverify, auto &ctx) mutable {
+    m_context->set_verify_callback([
+        this, rfc2818Hostname = std::move(rfc2818Hostname)
+    ](bool preverify, asio::ssl::verify_context &ctx) mutable {
 
-            if (!preverify &&
-                X509_STORE_CTX_get_error(ctx.native_handle()) ==
-                    X509_V_ERR_UNABLE_TO_GET_CRL)
-                preverify = true;
+        if (!preverify &&
+            X509_STORE_CTX_get_error(ctx.native_handle()) ==
+                X509_V_ERR_UNABLE_TO_GET_CRL)
+            preverify = true;
 
-            if (rfc2818Hostname.empty())
-                return preverify;
+        if (rfc2818Hostname.empty())
+            return preverify;
 
-            return asio::ssl::rfc2818_verification{rfc2818Hostname}(
-                preverify, ctx);
-        });
+        return asio::ssl::rfc2818_verification{rfc2818Hostname}(preverify, ctx);
+    });
+}
+
+WithSSLContext::WithSSLContext(std::shared_ptr<asio::ssl::context> context)
+    : m_context{std::move(context)}
+{
 }
 
 void WithSSLContext::addCertificateRevocationList(
@@ -85,7 +90,7 @@ void WithSSLContext::addCertificateRevocationList(
 
         if (crl) {
             if (X509_STORE *store =
-                    SSL_CTX_get_cert_store(m_context.native_handle())) {
+                    SSL_CTX_get_cert_store(m_context->native_handle())) {
                 if (X509_STORE_add_crl(store, crl.get()) == 1) {
                     return;
                 }
@@ -99,7 +104,7 @@ void WithSSLContext::addCertificateRevocationList(
 
 void WithSSLContext::addCertificateAuthority(const asio::const_buffer &data)
 {
-    m_context.add_certificate_authority(data);
+    m_context->add_certificate_authority(data);
 }
 
 void WithSSLContext::addChainCertificate(const asio::const_buffer &data)
@@ -113,7 +118,7 @@ void WithSSLContext::addChainCertificate(const asio::const_buffer &data)
 
         if (cert) {
             if (SSL_CTX_add_extra_chain_cert(
-                    m_context.native_handle(), cert.get()) == 1) {
+                    m_context->native_handle(), cert.get()) == 1) {
                 cert.release();
                 return;
             }
@@ -126,7 +131,7 @@ void WithSSLContext::addChainCertificate(const asio::const_buffer &data)
 
 void WithSSLContext::setVerifyMode(const asio::ssl::verify_mode mode)
 {
-    m_context.set_verify_mode(mode);
+    m_context->set_verify_mode(mode);
 }
 
 } // namespace detail

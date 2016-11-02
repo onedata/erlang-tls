@@ -12,10 +12,9 @@
 # OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 # CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-"""Enumerates the BoringSSL source in src/ and either generates two gypi files
-  (boringssl.gypi and boringssl_tests.gypi) for Chromium, or generates
-  source-list files for Android."""
+"""Enumerates source files for consumption by various build systems."""
 
+import optparse
 import os
 import subprocess
 import sys
@@ -39,18 +38,273 @@ OS_ARCH_COMBOS = [
 # perlasm system.
 NON_PERL_FILES = {
     ('linux', 'arm'): [
+        'src/crypto/curve25519/asm/x25519-asm-arm.S',
         'src/crypto/poly1305/poly1305_arm_asm.S',
-        'src/crypto/chacha/chacha_vec_arm.S',
-        'src/crypto/cpu-arm-asm.S',
+    ],
+    ('linux', 'x86_64'): [
+        'src/crypto/curve25519/asm/x25519-asm-x86_64.S',
+    ],
+    ('mac', 'x86_64'): [
+        'src/crypto/curve25519/asm/x25519-asm-x86_64.S',
     ],
 }
 
+PREFIX = None
 
-class Chromium(object):
+
+def PathOf(x):
+  return x if not PREFIX else os.path.join(PREFIX, x)
+
+
+class Android(object):
 
   def __init__(self):
     self.header = \
-"""# Copyright (c) 2014 The Chromium Authors. All rights reserved.
+"""# Copyright (C) 2015 The Android Open Source Project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+
+  def ExtraFiles(self):
+    return ['android_compat_hacks.c', 'android_compat_keywrap.c']
+
+  def PrintVariableSection(self, out, name, files):
+    out.write('%s := \\\n' % name)
+    for f in sorted(files):
+      out.write('  %s\\\n' % f)
+    out.write('\n')
+
+  def WriteFiles(self, files, asm_outputs):
+    with open('sources.mk', 'w+') as makefile:
+      makefile.write(self.header)
+
+      crypto_files = files['crypto'] + self.ExtraFiles()
+      self.PrintVariableSection(makefile, 'crypto_sources', crypto_files)
+      self.PrintVariableSection(makefile, 'ssl_sources', files['ssl'])
+      self.PrintVariableSection(makefile, 'tool_sources', files['tool'])
+
+      for ((osname, arch), asm_files) in asm_outputs:
+        self.PrintVariableSection(
+            makefile, '%s_%s_sources' % (osname, arch), asm_files)
+
+
+class AndroidStandalone(Android):
+  """AndroidStandalone is for Android builds outside of the Android-system, i.e.
+
+  for applications that wish wish to ship BoringSSL.
+  """
+
+  def ExtraFiles(self):
+    return []
+
+
+class Bazel(object):
+  """Bazel outputs files suitable for including in Bazel files."""
+
+  def __init__(self):
+    self.firstSection = True
+    self.header = \
+"""# This file is created by generate_build_files.py. Do not edit manually.
+
+"""
+
+  def PrintVariableSection(self, out, name, files):
+    if not self.firstSection:
+      out.write('\n')
+    self.firstSection = False
+
+    out.write('%s = [\n' % name)
+    for f in sorted(files):
+      out.write('    "%s",\n' % PathOf(f))
+    out.write(']\n')
+
+  def WriteFiles(self, files, asm_outputs):
+    with open('BUILD.generated.bzl', 'w+') as out:
+      out.write(self.header)
+
+      self.PrintVariableSection(out, 'ssl_headers', files['ssl_headers'])
+      self.PrintVariableSection(
+          out, 'ssl_internal_headers', files['ssl_internal_headers'])
+      self.PrintVariableSection(out, 'ssl_sources', files['ssl'])
+      self.PrintVariableSection(out, 'crypto_headers', files['crypto_headers'])
+      self.PrintVariableSection(
+          out, 'crypto_internal_headers', files['crypto_internal_headers'])
+      self.PrintVariableSection(out, 'crypto_sources', files['crypto'])
+      self.PrintVariableSection(out, 'tool_sources', files['tool'])
+      self.PrintVariableSection(out, 'tool_headers', files['tool_headers'])
+
+      for ((osname, arch), asm_files) in asm_outputs:
+        self.PrintVariableSection(
+            out, 'crypto_sources_%s_%s' % (osname, arch), asm_files)
+
+    with open('BUILD.generated_tests.bzl', 'w+') as out:
+      out.write(self.header)
+
+      out.write('test_support_sources = [\n')
+      for filename in (files['test_support'] +
+                       files['crypto_internal_headers'] +
+                       files['ssl_internal_headers']):
+        if os.path.basename(filename) == 'malloc.cc':
+          continue
+        out.write('    "%s",\n' % PathOf(filename))
+
+      out.write(']\n\n')
+
+      out.write('def create_tests(copts, crypto, ssl):\n')
+      name_counts = {}
+      for test in files['tests']:
+        name = os.path.basename(test[0])
+        name_counts[name] = name_counts.get(name, 0) + 1
+
+      first = True
+      for test in files['tests']:
+        name = os.path.basename(test[0])
+        if name_counts[name] > 1:
+          if '/' in test[1]:
+            name += '_' + os.path.splitext(os.path.basename(test[1]))[0]
+          else:
+            name += '_' + test[1].replace('-', '_')
+
+        if not first:
+          out.write('\n')
+        first = False
+
+        src_prefix = 'src/' + test[0]
+        for src in files['test']:
+          if src.startswith(src_prefix):
+            src = src
+            break
+        else:
+          raise ValueError("Can't find source for %s" % test[0])
+
+        out.write('  native.cc_test(\n')
+        out.write('      name = "%s",\n' % name)
+        out.write('      size = "small",\n')
+        out.write('      srcs = ["%s"] + test_support_sources,\n' %
+            PathOf(src))
+
+        data_files = []
+        if len(test) > 1:
+
+          out.write('      args = [\n')
+          for arg in test[1:]:
+            if '/' in arg:
+              out.write('          "$(location %s)",\n' %
+                  PathOf(os.path.join('src', arg)))
+              data_files.append('src/%s' % arg)
+            else:
+              out.write('          "%s",\n' % arg)
+          out.write('      ],\n')
+
+        out.write('      copts = copts,\n')
+
+        if len(data_files) > 0:
+          out.write('      data = [\n')
+          for filename in data_files:
+            out.write('          "%s",\n' % PathOf(filename))
+          out.write('      ],\n')
+
+        if 'ssl/' in test[0]:
+          out.write('      deps = [\n')
+          out.write('          crypto,\n')
+          out.write('          ssl,\n')
+          out.write('      ],\n')
+        else:
+          out.write('      deps = [crypto],\n')
+        out.write('  )\n')
+
+
+class GN(object):
+
+  def __init__(self):
+    self.firstSection = True
+    self.header = \
+"""# Copyright (c) 2016 The Chromium Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This file is created by generate_build_files.py. Do not edit manually.
+
+"""
+
+  def PrintVariableSection(self, out, name, files):
+    if not self.firstSection:
+      out.write('\n')
+    self.firstSection = False
+
+    out.write('%s = [\n' % name)
+    for f in sorted(files):
+      out.write('  "%s",\n' % f)
+    out.write(']\n')
+
+  def WriteFiles(self, files, asm_outputs):
+    with open('BUILD.generated.gni', 'w+') as out:
+      out.write(self.header)
+
+      self.PrintVariableSection(out, 'crypto_sources', files['crypto'])
+      self.PrintVariableSection(out, 'ssl_sources', files['ssl'])
+
+      for ((osname, arch), asm_files) in asm_outputs:
+        self.PrintVariableSection(
+            out, 'crypto_sources_%s_%s' % (osname, arch), asm_files)
+
+      fuzzers = [os.path.splitext(os.path.basename(fuzzer))[0]
+                 for fuzzer in files['fuzz']]
+      self.PrintVariableSection(out, 'fuzzers', fuzzers)
+
+    with open('BUILD.generated_tests.gni', 'w+') as out:
+      self.firstSection = True
+      out.write(self.header)
+
+      self.PrintVariableSection(out, '_test_support_sources',
+                                files['test_support'])
+      out.write('\n')
+
+      out.write('template("create_tests") {\n')
+
+      all_tests = []
+      for test in sorted(files['test']):
+        test_name = 'boringssl_%s' % os.path.splitext(os.path.basename(test))[0]
+        all_tests.append(test_name)
+
+        out.write('  executable("%s") {\n' % test_name)
+        out.write('    sources = [\n')
+        out.write('      "%s",\n' % test)
+        out.write('    ]\n')
+        out.write('    sources += _test_support_sources\n')
+        out.write('    if (defined(invoker.configs_exclude)) {\n')
+        out.write('      configs -= invoker.configs_exclude\n')
+        out.write('    }\n')
+        out.write('    configs += invoker.configs\n')
+        out.write('    deps = invoker.deps\n')
+        out.write('  }\n')
+        out.write('\n')
+
+      out.write('  group(target_name) {\n')
+      out.write('    deps = [\n')
+      for test_name in sorted(all_tests):
+        out.write('      ":%s",\n' % test_name)
+      out.write('    ]\n')
+      out.write('  }\n')
+      out.write('}\n')
+
+
+class GYP(object):
+
+  def __init__(self):
+    self.header = \
+"""# Copyright (c) 2016 The Chromium Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
@@ -110,174 +364,10 @@ class Chromium(object):
 
       test_gypi.write('    \'boringssl_test_targets\': [\n')
 
-      for test in test_names:
+      for test in sorted(test_names):
         test_gypi.write("""      '%s',\n""" % test)
 
       test_gypi.write('    ],\n  }\n}\n')
-
-
-class Android(object):
-
-  def __init__(self):
-    self.header = \
-"""# Copyright (C) 2015 The Android Open Source Project
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-
-  def ExtraFiles(self):
-    return ['android_compat_hacks.c', 'android_compat_keywrap.c']
-
-  def PrintVariableSection(self, out, name, files):
-    out.write('%s := \\\n' % name)
-    for f in sorted(files):
-      out.write('  %s\\\n' % f)
-    out.write('\n')
-
-  def WriteFiles(self, files, asm_outputs):
-    with open('sources.mk', 'w+') as makefile:
-      makefile.write(self.header)
-
-      files['crypto'].extend(self.ExtraFiles())
-      self.PrintVariableSection(makefile, 'crypto_sources', files['crypto'])
-      self.PrintVariableSection(makefile, 'ssl_sources', files['ssl'])
-      self.PrintVariableSection(makefile, 'tool_sources', files['tool'])
-
-      for ((osname, arch), asm_files) in asm_outputs:
-        self.PrintVariableSection(
-            makefile, '%s_%s_sources' % (osname, arch), asm_files)
-
-
-class AndroidStandalone(Android):
-  """AndroidStandalone is for Android builds outside of the Android-system, i.e.
-
-  for applications that wish wish to ship BoringSSL.
-  """
-
-  def ExtraFiles(self):
-    return []
-
-
-class Bazel(object):
-  """Bazel outputs files suitable for including in Bazel files."""
-
-  def __init__(self):
-    self.firstSection = True
-    self.header = \
-"""# This file is created by generate_build_files.py. Do not edit manually.
-
-"""
-
-  def PrintVariableSection(self, out, name, files):
-    if not self.firstSection:
-      out.write('\n')
-    self.firstSection = False
-
-    out.write('%s = [\n' % name)
-    for f in sorted(files):
-      out.write('    "%s",\n' % f)
-    out.write(']\n')
-
-  def WriteFiles(self, files, asm_outputs):
-    with open('BUILD.generated', 'w+') as out:
-      out.write(self.header)
-
-      self.PrintVariableSection(out, 'ssl_headers', files['ssl_headers'])
-      self.PrintVariableSection(
-          out, 'ssl_internal_headers', files['ssl_internal_headers'])
-      self.PrintVariableSection(out, 'ssl_sources', files['ssl'])
-      self.PrintVariableSection(out, 'crypto_headers', files['crypto_headers'])
-      self.PrintVariableSection(
-          out, 'crypto_internal_headers', files['crypto_internal_headers'])
-      self.PrintVariableSection(out, 'crypto_sources', files['crypto'])
-      self.PrintVariableSection(out, 'tool_sources', files['tool'])
-
-      for ((osname, arch), asm_files) in asm_outputs:
-        if osname is not 'linux':
-          continue
-        self.PrintVariableSection(
-            out, 'crypto_sources_%s' % arch, asm_files)
-
-    with open('BUILD.generated_tests', 'w+') as out:
-      out.write(self.header)
-
-      out.write('test_support_sources = [\n')
-      for filename in files['test_support']:
-        if os.path.basename(filename) == 'malloc.cc':
-          continue
-        out.write('    "%s",\n' % filename)
-      out.write('] + glob(["src/crypto/test/*.h"])\n\n')
-
-      name_counts = {}
-      for test in files['tests']:
-        name = os.path.basename(test[0])
-        name_counts[name] = name_counts.get(name, 0) + 1
-
-      first = True
-      for test in files['tests']:
-        name = os.path.basename(test[0])
-        if name_counts[name] > 1:
-          if '/' in test[1]:
-            name += '_' + os.path.splitext(os.path.basename(test[1]))[0]
-          else:
-            name += '_' + test[1].replace('-', '_')
-
-        if not first:
-          out.write('\n')
-        first = False
-
-        src_prefix = 'src/' + test[0]
-        for src in files['test']:
-          if src.startswith(src_prefix):
-            src = src
-            break
-        else:
-          raise ValueError("Can't find source for %s" % test[0])
-
-        out.write('cc_test(\n')
-        out.write('    name = "%s",\n' % name)
-        out.write('    size = "small",\n')
-        out.write('    srcs = ["%s"] + test_support_sources,\n' % src)
-
-        data_files = []
-        if len(test) > 1:
-
-          out.write('    args = [\n')
-          for arg in test[1:]:
-            if '/' in arg:
-              out.write('        "$(location src/%s)",\n' % arg)
-              data_files.append('src/%s' % arg)
-            else:
-              out.write('        "%s",\n' % arg)
-          out.write('    ],\n')
-
-        out.write('    copts = boringssl_copts,\n')
-
-        if len(data_files) > 0:
-          out.write('    data = [\n')
-          for filename in data_files:
-            out.write('        "%s",\n' % filename)
-          out.write('    ],\n')
-
-        if 'ssl/' in test[0]:
-          out.write('    deps = [\n')
-          out.write('        ":crypto",\n')
-          out.write('        ":ssl",\n')
-          out.write('    ],\n')
-        else:
-          out.write('    deps = [":crypto"],\n')
-        out.write(')\n')
 
 
 def FindCMakeFiles(directory):
@@ -350,6 +440,10 @@ def FindHeaderFiles(directory, filter_func):
         continue
       hfiles.append(os.path.join(path, filename))
 
+      for (i, dirname) in enumerate(dirnames):
+        if not filter_func(dirname, True):
+          del dirnames[i]
+
   return hfiles
 
 
@@ -394,10 +488,8 @@ def PerlAsm(output_filename, input_filename, perlasm_style, extra_args):
   base_dir = os.path.dirname(output_filename)
   if not os.path.isdir(base_dir):
     os.makedirs(base_dir)
-  output = subprocess.check_output(
-      ['perl', input_filename, perlasm_style] + extra_args)
-  with open(output_filename, 'w+') as out_file:
-    out_file.write(output)
+  subprocess.check_call(
+      ['perl', input_filename, perlasm_style] + extra_args + [output_filename])
 
 
 def ArchForAsmFilename(filename):
@@ -453,7 +545,8 @@ def WriteAsmFiles(perlasms):
 def main(platforms):
   crypto_c_files = FindCFiles(os.path.join('src', 'crypto'), NoTests)
   ssl_c_files = FindCFiles(os.path.join('src', 'ssl'), NoTests)
-  tool_cc_files = FindCFiles(os.path.join('src', 'tool'), NoTests)
+  tool_c_files = FindCFiles(os.path.join('src', 'tool'), NoTests)
+  tool_h_files = FindHeaderFiles(os.path.join('src', 'tool'), AllFiles)
 
   # Generate err_data.c
   with open('err_data.c', 'w+') as err_data:
@@ -462,11 +555,16 @@ def main(platforms):
                           stdout=err_data)
   crypto_c_files.append('err_data.c')
 
-  test_support_cc_files = FindCFiles(os.path.join('src', 'crypto', 'test'),
-                                     AllFiles)
+  test_support_c_files = FindCFiles(os.path.join('src', 'crypto', 'test'),
+                                    AllFiles)
+  test_support_h_files = (
+      FindHeaderFiles(os.path.join('src', 'crypto', 'test'), AllFiles) +
+      FindHeaderFiles(os.path.join('src', 'ssl', 'test'), AllFiles))
 
   test_c_files = FindCFiles(os.path.join('src', 'crypto'), OnlyTests)
   test_c_files += FindCFiles(os.path.join('src', 'ssl'), OnlyTests)
+
+  fuzz_c_files = FindCFiles(os.path.join('src', 'fuzz'), NoTests)
 
   ssl_h_files = (
       FindHeaderFiles(
@@ -486,6 +584,8 @@ def main(platforms):
 
   with open('src/util/all_tests.json', 'r') as f:
     tests = json.load(f)
+  # Skip tests for libdecrepit. Consumers import that manually.
+  tests = [test for test in tests if not test[0].startswith("decrepit/")]
   test_binaries = set([test[0] for test in tests])
   test_sources = set([
       test.replace('.cc', '').replace('.c', '').replace(
@@ -505,12 +605,14 @@ def main(platforms):
       'crypto': crypto_c_files,
       'crypto_headers': crypto_h_files,
       'crypto_internal_headers': crypto_internal_h_files,
+      'fuzz': fuzz_c_files,
       'ssl': ssl_c_files,
       'ssl_headers': ssl_h_files,
       'ssl_internal_headers': ssl_internal_h_files,
-      'tool': tool_cc_files,
+      'tool': tool_c_files,
+      'tool_headers': tool_h_files,
       'test': test_c_files,
-      'test_support': test_support_cc_files,
+      'test_support': test_support_h_files + test_support_c_files,
       'tests': tests,
   }
 
@@ -522,26 +624,32 @@ def main(platforms):
   return 0
 
 
-def Usage():
-  print 'Usage: python %s [chromium|android|android-standalone|bazel]' % sys.argv[0]
-  sys.exit(1)
-
-
 if __name__ == '__main__':
-  if len(sys.argv) < 2:
-    Usage()
+  parser = optparse.OptionParser(usage='Usage: %prog [--prefix=<path>]'
+      ' [android|android-standalone|bazel|gn|gyp]')
+  parser.add_option('--prefix', dest='prefix',
+      help='For Bazel, prepend argument to all source files')
+  options, args = parser.parse_args(sys.argv[1:])
+  PREFIX = options.prefix
+
+  if not args:
+    parser.print_help()
+    sys.exit(1)
 
   platforms = []
-  for s in sys.argv[1:]:
-    if s == 'chromium' or s == 'gyp':
-      platforms.append(Chromium())
-    elif s == 'android':
+  for s in args:
+    if s == 'android':
       platforms.append(Android())
     elif s == 'android-standalone':
       platforms.append(AndroidStandalone())
     elif s == 'bazel':
       platforms.append(Bazel())
+    elif s == 'gn':
+      platforms.append(GN())
+    elif s == 'gyp':
+      platforms.append(GYP())
     else:
-      Usage()
+      parser.print_help()
+      sys.exit(1)
 
   sys.exit(main(platforms))

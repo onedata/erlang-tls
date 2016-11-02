@@ -56,19 +56,20 @@ const Flag<bool> kBoolFlags[] = {
     &TestConfig::write_different_record_sizes },
   { "-cbc-record-splitting", &TestConfig::cbc_record_splitting },
   { "-partial-write", &TestConfig::partial_write },
+  { "-no-tls13", &TestConfig::no_tls13 },
   { "-no-tls12", &TestConfig::no_tls12 },
   { "-no-tls11", &TestConfig::no_tls11 },
   { "-no-tls1", &TestConfig::no_tls1 },
   { "-no-ssl3", &TestConfig::no_ssl3 },
+  { "-enable-channel-id", &TestConfig::enable_channel_id },
   { "-shim-writes-first", &TestConfig::shim_writes_first },
-  { "-tls-d5-bug", &TestConfig::tls_d5_bug },
   { "-expect-session-miss", &TestConfig::expect_session_miss },
+  { "-decline-alpn", &TestConfig::decline_alpn },
   { "-expect-extended-master-secret",
     &TestConfig::expect_extended_master_secret },
   { "-enable-ocsp-stapling", &TestConfig::enable_ocsp_stapling },
   { "-enable-signed-cert-timestamps",
     &TestConfig::enable_signed_cert_timestamps },
-  { "-fastradio-padding", &TestConfig::fastradio_padding },
   { "-implicit-handshake", &TestConfig::implicit_handshake },
   { "-use-early-callback", &TestConfig::use_early_callback },
   { "-fail-early-callback", &TestConfig::fail_early_callback },
@@ -77,17 +78,36 @@ const Flag<bool> kBoolFlags[] = {
   { "-fail-second-ddos-callback", &TestConfig::fail_second_ddos_callback },
   { "-handshake-never-done", &TestConfig::handshake_never_done },
   { "-use-export-context", &TestConfig::use_export_context },
-  { "-reject-peer-renegotiations", &TestConfig::reject_peer_renegotiations },
-  { "-no-legacy-server-connect", &TestConfig::no_legacy_server_connect },
   { "-tls-unique", &TestConfig::tls_unique },
-  { "-use-async-private-key", &TestConfig::use_async_private_key },
   { "-expect-ticket-renewal", &TestConfig::expect_ticket_renewal },
   { "-expect-no-session", &TestConfig::expect_no_session },
   { "-use-ticket-callback", &TestConfig::use_ticket_callback },
   { "-renew-ticket", &TestConfig::renew_ticket },
+  { "-enable-client-custom-extension",
+    &TestConfig::enable_client_custom_extension },
+  { "-enable-server-custom-extension",
+    &TestConfig::enable_server_custom_extension },
+  { "-custom-extension-skip", &TestConfig::custom_extension_skip },
+  { "-custom-extension-fail-add", &TestConfig::custom_extension_fail_add },
+  { "-check-close-notify", &TestConfig::check_close_notify },
+  { "-shim-shuts-down", &TestConfig::shim_shuts_down },
+  { "-verify-fail", &TestConfig::verify_fail },
+  { "-verify-peer", &TestConfig::verify_peer },
+  { "-expect-verify-result", &TestConfig::expect_verify_result },
+  { "-renegotiate-once", &TestConfig::renegotiate_once },
+  { "-renegotiate-freely", &TestConfig::renegotiate_freely },
+  { "-renegotiate-ignore", &TestConfig::renegotiate_ignore },
+  { "-disable-npn", &TestConfig::disable_npn },
+  { "-p384-only", &TestConfig::p384_only },
+  { "-enable-all-curves", &TestConfig::enable_all_curves },
+  { "-use-sparse-dh-prime", &TestConfig::use_sparse_dh_prime },
+  { "-use-old-client-cert-callback",
+    &TestConfig::use_old_client_cert_callback },
+  { "-use-null-client-ca-list", &TestConfig::use_null_client_ca_list },
 };
 
 const Flag<std::string> kStringFlags[] = {
+  { "-digest-prefs", &TestConfig::digest_prefs },
   { "-key-file", &TestConfig::key_file },
   { "-cert-file", &TestConfig::cert_file },
   { "-expect-server-name", &TestConfig::expected_server_name },
@@ -104,6 +124,8 @@ const Flag<std::string> kStringFlags[] = {
   { "-psk-identity", &TestConfig::psk_identity },
   { "-srtp-profiles", &TestConfig::srtp_profiles },
   { "-cipher", &TestConfig::cipher },
+  { "-cipher-tls10", &TestConfig::cipher_tls10 },
+  { "-cipher-tls11", &TestConfig::cipher_tls11 },
   { "-export-label", &TestConfig::export_label },
   { "-export-context", &TestConfig::export_context },
 };
@@ -114,6 +136,8 @@ const Flag<std::string> kBase64Flags[] = {
   { "-expect-ocsp-response", &TestConfig::expected_ocsp_response },
   { "-expect-signed-cert-timestamps",
     &TestConfig::expected_signed_cert_timestamps },
+  { "-ocsp-response", &TestConfig::ocsp_response },
+  { "-signed-cert-timestamps", &TestConfig::signed_cert_timestamps },
 };
 
 const Flag<int> kIntFlags[] = {
@@ -122,6 +146,16 @@ const Flag<int> kIntFlags[] = {
   { "-max-version", &TestConfig::max_version },
   { "-mtu", &TestConfig::mtu },
   { "-export-keying-material", &TestConfig::export_keying_material },
+  { "-expect-total-renegotiations", &TestConfig::expect_total_renegotiations },
+  { "-expect-peer-signature-algorithm",
+    &TestConfig::expect_peer_signature_algorithm },
+  { "-expect-curve-id", &TestConfig::expect_curve_id },
+  { "-expect-dhe-group-size", &TestConfig::expect_dhe_group_size },
+  { "-initial-timeout-duration-ms", &TestConfig::initial_timeout_duration_ms },
+};
+
+const Flag<std::vector<int>> kIntVectorFlags[] = {
+  { "-signing-prefs", &TestConfig::signing_prefs },
 };
 
 }  // namespace
@@ -155,12 +189,14 @@ bool ParseConfig(int argc, char **argv, TestConfig *out_config) {
       size_t len;
       if (!EVP_DecodedLength(&len, strlen(argv[i]))) {
         fprintf(stderr, "Invalid base64: %s\n", argv[i]);
+        return false;
       }
       std::unique_ptr<uint8_t[]> decoded(new uint8_t[len]);
       if (!EVP_DecodeBase64(decoded.get(), &len, len,
                             reinterpret_cast<const uint8_t *>(argv[i]),
                             strlen(argv[i]))) {
         fprintf(stderr, "Invalid base64: %s\n", argv[i]);
+        return false;
       }
       base64_field->assign(reinterpret_cast<const char *>(decoded.get()), len);
       continue;
@@ -174,6 +210,20 @@ bool ParseConfig(int argc, char **argv, TestConfig *out_config) {
         return false;
       }
       *int_field = atoi(argv[i]);
+      continue;
+    }
+
+    std::vector<int> *int_vector_field =
+        FindField(out_config, kIntVectorFlags, argv[i]);
+    if (int_vector_field) {
+      i++;
+      if (i >= argc) {
+        fprintf(stderr, "Missing parameter\n");
+        return false;
+      }
+
+      // Each instance of the flag adds to the list.
+      int_vector_field->push_back(atoi(argv[i]));
       continue;
     }
 

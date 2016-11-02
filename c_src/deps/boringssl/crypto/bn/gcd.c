@@ -223,19 +223,22 @@ err:
 }
 
 /* solves ax == 1 (mod n) */
-static BIGNUM *BN_mod_inverse_no_branch(BIGNUM *out, const BIGNUM *a,
-                                        const BIGNUM *n, BN_CTX *ctx);
+static BIGNUM *BN_mod_inverse_no_branch(BIGNUM *out, int *out_no_inverse,
+                                        const BIGNUM *a, const BIGNUM *n,
+                                        BN_CTX *ctx);
 
-BIGNUM *BN_mod_inverse(BIGNUM *out, const BIGNUM *a, const BIGNUM *n,
-                       BN_CTX *ctx) {
+BIGNUM *BN_mod_inverse_ex(BIGNUM *out, int *out_no_inverse, const BIGNUM *a,
+                          const BIGNUM *n, BN_CTX *ctx) {
   BIGNUM *A, *B, *X, *Y, *M, *D, *T, *R = NULL;
   BIGNUM *ret = NULL;
   int sign;
 
   if ((a->flags & BN_FLG_CONSTTIME) != 0 ||
       (n->flags & BN_FLG_CONSTTIME) != 0) {
-    return BN_mod_inverse_no_branch(out, a, n, ctx);
+    return BN_mod_inverse_no_branch(out, out_no_inverse, a, n, ctx);
   }
+
+  *out_no_inverse = 0;
 
   BN_CTX_start(ctx);
   A = BN_CTX_get(ctx);
@@ -276,7 +279,7 @@ BIGNUM *BN_mod_inverse(BIGNUM *out, const BIGNUM *a, const BIGNUM *n,
    *      sign*Y*a  ==  A   (mod |n|).
    */
 
-  if (BN_is_odd(n) && (BN_num_bits(n) <= (BN_BITS <= 32 ? 450 : 2048))) {
+  if (BN_is_odd(n) && (BN_num_bits(n) <= (BN_BITS2 <= 32 ? 450 : 2048))) {
     /* Binary inversion algorithm; requires odd modulus.
      * This is faster than the general algorithm if the modulus
      * is sufficiently small (about 400 .. 500 bits on 32-bit
@@ -497,6 +500,12 @@ BIGNUM *BN_mod_inverse(BIGNUM *out, const BIGNUM *a, const BIGNUM *n,
     }
   }
 
+  if (!BN_is_one(A)) {
+    *out_no_inverse = 1;
+    OPENSSL_PUT_ERROR(BN, BN_R_NO_INVERSE);
+    goto err;
+  }
+
   /* The while loop (Euclid's algorithm) ends when
    *      A == gcd(a,n);
    * we have
@@ -510,21 +519,17 @@ BIGNUM *BN_mod_inverse(BIGNUM *out, const BIGNUM *a, const BIGNUM *n,
   }
   /* Now  Y*a  ==  A  (mod |n|).  */
 
-  if (BN_is_one(A)) {
-    /* Y*a == 1  (mod |n|) */
-    if (!Y->neg && BN_ucmp(Y, n) < 0) {
-      if (!BN_copy(R, Y)) {
-        goto err;
-      }
-    } else {
-      if (!BN_nnmod(R, Y, n, ctx)) {
-        goto err;
-      }
+  /* Y*a == 1  (mod |n|) */
+  if (!Y->neg && BN_ucmp(Y, n) < 0) {
+    if (!BN_copy(R, Y)) {
+      goto err;
     }
   } else {
-    OPENSSL_PUT_ERROR(BN, BN_mod_inverse, BN_R_NO_INVERSE);
-    goto err;
+    if (!BN_nnmod(R, Y, n, ctx)) {
+      goto err;
+    }
   }
+
   ret = R;
 
 err:
@@ -535,15 +540,24 @@ err:
   return ret;
 }
 
+BIGNUM *BN_mod_inverse(BIGNUM *out, const BIGNUM *a, const BIGNUM *n,
+                       BN_CTX *ctx) {
+  int no_inverse;
+  return BN_mod_inverse_ex(out, &no_inverse, a, n, ctx);
+}
+
 /* BN_mod_inverse_no_branch is a special version of BN_mod_inverse.
  * It does not contain branches that may leak sensitive information. */
-static BIGNUM *BN_mod_inverse_no_branch(BIGNUM *out, const BIGNUM *a,
-                                        const BIGNUM *n, BN_CTX *ctx) {
+static BIGNUM *BN_mod_inverse_no_branch(BIGNUM *out, int *out_no_inverse,
+                                        const BIGNUM *a, const BIGNUM *n,
+                                        BN_CTX *ctx) {
   BIGNUM *A, *B, *X, *Y, *M, *D, *T, *R = NULL;
   BIGNUM local_A, local_B;
   BIGNUM *pA, *pB;
   BIGNUM *ret = NULL;
   int sign;
+
+  *out_no_inverse = 0;
 
   BN_CTX_start(ctx);
   A = BN_CTX_get(ctx);
@@ -655,6 +669,12 @@ static BIGNUM *BN_mod_inverse_no_branch(BIGNUM *out, const BIGNUM *a,
     sign = -sign;
   }
 
+  if (!BN_is_one(A)) {
+    *out_no_inverse = 1;
+    OPENSSL_PUT_ERROR(BN, BN_R_NO_INVERSE);
+    goto err;
+  }
+
   /*
    * The while loop (Euclid's algorithm) ends when
    *      A == gcd(a,n);
@@ -670,21 +690,17 @@ static BIGNUM *BN_mod_inverse_no_branch(BIGNUM *out, const BIGNUM *a,
   }
   /* Now  Y*a  ==  A  (mod |n|).  */
 
-  if (BN_is_one(A)) {
-    /* Y*a == 1  (mod |n|) */
-    if (!Y->neg && BN_ucmp(Y, n) < 0) {
-      if (!BN_copy(R, Y)) {
-        goto err;
-      }
-    } else {
-      if (!BN_nnmod(R, Y, n, ctx)) {
-        goto err;
-      }
+  /* Y*a == 1  (mod |n|) */
+  if (!Y->neg && BN_ucmp(Y, n) < 0) {
+    if (!BN_copy(R, Y)) {
+      goto err;
     }
   } else {
-    OPENSSL_PUT_ERROR(BN, BN_mod_inverse_no_branch, BN_R_NO_INVERSE);
-    goto err;
+    if (!BN_nnmod(R, Y, n, ctx)) {
+      goto err;
+    }
   }
+
   ret = R;
 
 err:

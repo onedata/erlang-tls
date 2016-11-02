@@ -128,12 +128,30 @@ int CBS_get_u32(CBS *cbs, uint32_t *out) {
   return cbs_get_u(cbs, out, 4);
 }
 
+int CBS_get_last_u8(CBS *cbs, uint8_t *out) {
+  if (cbs->len == 0) {
+    return 0;
+  }
+  *out = cbs->data[cbs->len - 1];
+  cbs->len--;
+  return 1;
+}
+
 int CBS_get_bytes(CBS *cbs, CBS *out, size_t len) {
   const uint8_t *v;
   if (!cbs_get(cbs, &v, len)) {
     return 0;
   }
   CBS_init(out, v, len);
+  return 1;
+}
+
+int CBS_copy_bytes(CBS *cbs, uint8_t *out, size_t len) {
+  const uint8_t *v;
+  if (!cbs_get(cbs, &v, len)) {
+    return 0;
+  }
+  memcpy(out, v, len);
   return 1;
 }
 
@@ -172,8 +190,14 @@ static int cbs_get_any_asn1_element(CBS *cbs, CBS *out, unsigned *out_tag,
     return 0;
   }
 
+  /* ITU-T X.690 section 8.1.2.3 specifies the format for identifiers with a tag
+   * number no greater than 30.
+   *
+   * If the number portion is 31 (0x1f, the largest value that fits in the
+   * allotted bits), then the tag is more than one byte long and the
+   * continuation bytes contain the tag number. This parser only supports tag
+   * numbers less than 31 (and thus single-byte tags). */
   if ((tag & 0x1f) == 0x1f) {
-    /* Long form tags are not supported. */
     return 0;
   }
 
@@ -182,6 +206,8 @@ static int cbs_get_any_asn1_element(CBS *cbs, CBS *out, unsigned *out_tag,
   }
 
   size_t len;
+  /* The format for the length encoding is specified in ITU-T X.690 section
+   * 8.1.3. */
   if ((length_byte & 0x80) == 0) {
     /* Short form length. */
     len = ((size_t) length_byte) + 2;
@@ -189,7 +215,9 @@ static int cbs_get_any_asn1_element(CBS *cbs, CBS *out, unsigned *out_tag,
       *out_header_len = 2;
     }
   } else {
-    /* Long form length. */
+    /* The high bit indicate that this is the long form, while the next 7 bits
+     * encode the number of subsequent octets used to encode the length (ITU-T
+     * X.690 clause 8.1.3.5.b). */
     const size_t num_bytes = length_byte & 0x7f;
     uint32_t len32;
 
@@ -201,12 +229,18 @@ static int cbs_get_any_asn1_element(CBS *cbs, CBS *out, unsigned *out_tag,
       return CBS_get_bytes(cbs, out, 2);
     }
 
+    /* ITU-T X.690 clause 8.1.3.5.c specifies that the value 0xff shall not be
+     * used as the first byte of the length. If this parser encounters that
+     * value, num_bytes will be parsed as 127, which will fail the check below.
+     */
     if (num_bytes == 0 || num_bytes > 4) {
       return 0;
     }
     if (!cbs_get_u(&header, &len32, num_bytes)) {
       return 0;
     }
+    /* ITU-T X.690 section 10.1 (DER length forms) requires encoding the length
+     * with the minimum number of octets. */
     if (len32 < 128) {
       /* Length should have used short-form encoding. */
       return 0;
@@ -320,14 +354,19 @@ int CBS_get_asn1_uint64(CBS *cbs, uint64_t *out) {
 }
 
 int CBS_get_optional_asn1(CBS *cbs, CBS *out, int *out_present, unsigned tag) {
+  int present = 0;
+
   if (CBS_peek_asn1_tag(cbs, tag)) {
     if (!CBS_get_asn1(cbs, out, tag)) {
       return 0;
     }
-    *out_present = 1;
-  } else {
-    *out_present = 0;
+    present = 1;
   }
+
+  if (out_present != NULL) {
+    *out_present = present;
+  }
+
   return 1;
 }
 

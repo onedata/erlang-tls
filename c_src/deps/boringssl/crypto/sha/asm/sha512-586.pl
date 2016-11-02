@@ -37,7 +37,7 @@
 #
 # IALU code-path is optimized for elder Pentiums. On vanilla Pentium
 # performance improvement over compiler generated code reaches ~60%,
-# while on PIII - ~35%. On newer µ-archs improvement varies from 15%
+# while on PIII - ~35%. On newer Âµ-archs improvement varies from 15%
 # to 50%, but it's less important as they are expected to execute SSE2
 # code-path, which is commonly ~2-3x faster [than compiler generated
 # code]. SSE2 code-path is as fast as original sha512-sse2.pl, even
@@ -49,6 +49,9 @@
 $0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
 push(@INC,"${dir}","${dir}../../perlasm");
 require "x86asm.pl";
+
+$output=pop;
+open STDOUT,">$output";
 
 &asm_init($ARGV[0],"sha512-586.pl",$ARGV[$#ARGV] eq "386");
 
@@ -909,3 +912,5 @@ sub BODY_00_15_ssse3 {		# "phase-less" copy of BODY_00_15_sse2
 &asciz("SHA512 block transform for x86, CRYPTOGAMS by <appro\@openssl.org>");
 
 &asm_finish();
+
+close STDOUT;

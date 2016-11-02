@@ -57,11 +57,12 @@
 #include <openssl/cast.h>
 
 #if defined(OPENSSL_WINDOWS)
-#pragma warning(push, 3)
+OPENSSL_MSVC_PRAGMA(warning(push, 3))
 #include <intrin.h>
-#pragma warning(pop)
+OPENSSL_MSVC_PRAGMA(warning(pop))
 #endif
 
+#include "internal.h"
 #include "../macros.h"
 
 
@@ -79,15 +80,6 @@ void CAST_ecb_encrypt(const uint8_t *in, uint8_t *out, const CAST_KEY *ks,
   l2n(d[0], out);
   l2n(d[1], out);
 }
-
-extern const uint32_t CAST_S_table0[256];
-extern const uint32_t CAST_S_table1[256];
-extern const uint32_t CAST_S_table2[256];
-extern const uint32_t CAST_S_table3[256];
-extern const uint32_t CAST_S_table4[256];
-extern const uint32_t CAST_S_table5[256];
-extern const uint32_t CAST_S_table6[256];
-extern const uint32_t CAST_S_table7[256];
 
 #if defined(OPENSSL_WINDOWS) && defined(_MSC_VER)
 #define ROTL(a, n) (_lrotl(a, n))

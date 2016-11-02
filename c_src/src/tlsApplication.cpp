@@ -3,10 +3,12 @@
  * @author Konrad Zemek
  * @copyright (C) 2015 ACK CYFRONET AGH
  * @copyright This software is released under the MIT license cited in
- * 'LICENSE.txt'
+ * 'LICENSE.md'
  */
 
 #include "tlsApplication.hpp"
+
+#include "utils.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -22,7 +24,10 @@ TLSApplication::TLSApplication(std::size_t n)
 
     for (auto &ios : m_ioServices) {
         m_works.emplace_back(asio::make_work(*ios));
-        m_threads.emplace_back([&] { ios->run(); });
+        m_threads.emplace_back([&] {
+            utils::nameThread("TLSApplication");
+            ios->run();
+        });
     }
 }
 

@@ -3,7 +3,7 @@
  * @author Konrad Zemek
  * @copyright (C) 2015 ACK CYFRONET AGH
  * @copyright This software is released under the MIT license cited in
- * 'LICENSE.txt'
+ * 'LICENSE.md'
  */
 
 #ifndef ONE_ETLS_DETAIL_HPP
@@ -11,6 +11,8 @@
 
 #include <asio/buffer.hpp>
 #include <asio/ssl/context.hpp>
+
+#include <memory>
 
 namespace one {
 namespace etls {
@@ -32,6 +34,14 @@ public:
     WithSSLContext(const asio::ssl::context_base::method method,
         const std::string &certPath = "", const std::string &keyPath = "",
         std::string rfc2818Hostname = "");
+
+    /**
+     * Constructor.
+     * Shares an existing context with @c this . The context can no longer be
+     * modified or undefined behaviour will occur.
+     * @param other The shared context to use.
+     */
+    WithSSLContext(std::shared_ptr<asio::ssl::context> context);
 
     /**
      * Adds a certificate revocation list to the context.
@@ -58,7 +68,7 @@ public:
     virtual void setVerifyMode(const asio::ssl::verify_mode mode);
 
 protected:
-    asio::ssl::context m_context;
+    std::shared_ptr<asio::ssl::context> m_context;
 };
 
 } // namespace detail

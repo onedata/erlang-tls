@@ -60,6 +60,9 @@ $0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
 push(@INC,"${dir}","${dir}../../perlasm");
 require "x86asm.pl";
 
+$output=pop;
+open STDOUT,">$output";
+
 &asm_init($ARGV[0],"rc4-586.pl",$x86only = $ARGV[$#ARGV] eq "386");
 
 $xx="eax";
@@ -384,31 +387,6 @@ $idx="edx";
 	&mov	(&DWP(-4,$out),"eax");		# key->y=0;
 &function_end("asm_RC4_set_key");
 
-# const char *RC4_options(void);
-&function_begin_B("RC4_options");
-	&call	(&label("pic_point"));
-&set_label("pic_point");
-	&blindpop("eax");
-	&lea	("eax",&DWP(&label("opts")."-".&label("pic_point"),"eax"));
-	&picmeup("edx","OPENSSL_ia32cap_P");
-	&mov	("edx",&DWP(0,"edx"));
-	&bt	("edx",20);
-	&jc	(&label("1xchar"));
-	&bt	("edx",26);
-	&jnc	(&label("ret"));
-	&add	("eax",25);
-	&ret	();
-&set_label("1xchar");
-	&add	("eax",12);
-&set_label("ret");
-	&ret	();
-&set_label("opts",64);
-&asciz	("rc4(4x,int)");
-&asciz	("rc4(1x,char)");
-&asciz	("rc4(8x,mmx)");
-&asciz	("RC4 for x86, CRYPTOGAMS by <appro\@openssl.org>");
-&align	(64);
-&function_end_B("RC4_options");
-
 &asm_finish();
 
+close STDOUT;

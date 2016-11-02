@@ -1,4 +1,3 @@
-/* ssl/tls1.h */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -148,19 +147,17 @@
  * OTHERWISE.
  */
 
-#ifndef HEADER_TLS1_H
-#define HEADER_TLS1_H
+#ifndef OPENSSL_HEADER_TLS1_H
+#define OPENSSL_HEADER_TLS1_H
 
-#include <openssl/buf.h>
-#include <openssl/stack.h>
+#include <openssl/base.h>
 
 #ifdef  __cplusplus
 extern "C" {
 #endif
 
 
-#define TLS1_ALLOW_EXPERIMENTAL_CIPHERSUITES 0
-
+#define TLS1_AD_END_OF_EARLY_DATA 1
 #define TLS1_AD_DECRYPTION_FAILED 21
 #define TLS1_AD_RECORD_OVERFLOW 22
 #define TLS1_AD_UNKNOWN_CA 48    /* fatal */
@@ -173,6 +170,7 @@ extern "C" {
 #define TLS1_AD_INTERNAL_ERROR 80        /* fatal */
 #define TLS1_AD_USER_CANCELLED 90
 #define TLS1_AD_NO_RENEGOTIATION 100
+#define TLS1_AD_MISSING_EXTENSION 109
 /* codes 110-114 are from RFC3546 */
 #define TLS1_AD_UNSUPPORTED_EXTENSION 110
 #define TLS1_AD_CERTIFICATE_UNOBTAINABLE 111
@@ -181,53 +179,45 @@ extern "C" {
 #define TLS1_AD_BAD_CERTIFICATE_HASH_VALUE 114
 #define TLS1_AD_UNKNOWN_PSK_IDENTITY 115 /* fatal */
 
-/* ExtensionType values from RFC3546 / RFC4366 / RFC6066 */
+/* ExtensionType values from RFC6066 */
 #define TLSEXT_TYPE_server_name 0
-#define TLSEXT_TYPE_max_fragment_length 1
-#define TLSEXT_TYPE_client_certificate_url 2
-#define TLSEXT_TYPE_trusted_ca_keys 3
-#define TLSEXT_TYPE_truncated_hmac 4
 #define TLSEXT_TYPE_status_request 5
-/* ExtensionType values from RFC4681 */
-#define TLSEXT_TYPE_user_mapping 6
-
-/* ExtensionType values from RFC5878 */
-#define TLSEXT_TYPE_client_authz 7
-#define TLSEXT_TYPE_server_authz 8
-
-/* ExtensionType values from RFC6091 */
-#define TLSEXT_TYPE_cert_type 9
 
 /* ExtensionType values from RFC4492 */
-#define TLSEXT_TYPE_elliptic_curves 10
 #define TLSEXT_TYPE_ec_point_formats 11
-
-/* ExtensionType value from RFC5054 */
-#define TLSEXT_TYPE_srp 12
 
 /* ExtensionType values from RFC5246 */
 #define TLSEXT_TYPE_signature_algorithms 13
 
 /* ExtensionType value from RFC5764 */
-#define TLSEXT_TYPE_use_srtp 14
-
-/* ExtensionType value from RFC5620 */
-#define TLSEXT_TYPE_heartbeat 15
+#define TLSEXT_TYPE_srtp 14
 
 /* ExtensionType value from RFC7301 */
 #define TLSEXT_TYPE_application_layer_protocol_negotiation 16
 
-/* ExtensionType value for TLS padding extension.
- * http://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml
- * http://tools.ietf.org/html/draft-agl-tls-padding-03
- */
+/* ExtensionType value from RFC7685 */
 #define TLSEXT_TYPE_padding 21
 
-/* https://tools.ietf.org/html/draft-ietf-tls-session-hash-01 */
+/* ExtensionType value from RFC7627 */
 #define TLSEXT_TYPE_extended_master_secret 23
 
 /* ExtensionType value from RFC4507 */
 #define TLSEXT_TYPE_session_ticket 35
+
+/* ExtensionType values from draft-ietf-tls-tls13-13 */
+#define TLSEXT_TYPE_supported_groups 10
+#define TLSEXT_TYPE_key_share 40
+#define TLSEXT_TYPE_pre_shared_key 41
+#define TLSEXT_TYPE_early_data 42
+#define TLSEXT_TYPE_cookie 44
+
+/* TLSEXT_TYPE_draft_version is the extension used to advertise the TLS 1.3
+ * draft implemented.
+ *
+ * See
+ * https://github.com/tlswg/tls13-spec/wiki/Implementations#version-negotiation
+ */
+#define TLSEXT_TYPE_draft_version 0xff02
 
 /* ExtensionType value from RFC5746 */
 #define TLSEXT_TYPE_renegotiate 0xff01
@@ -239,18 +229,14 @@ extern "C" {
 #define TLSEXT_TYPE_next_proto_neg 13172
 
 /* This is not an IANA defined extension number */
-#define TLSEXT_TYPE_channel_id 30031
-#define TLSEXT_TYPE_channel_id_new 30032
+#define TLSEXT_TYPE_channel_id 30032
 
-/* NameType value from RFC 3546 */
-#define TLSEXT_NAMETYPE_host_name 0
 /* status request value from RFC 3546 */
 #define TLSEXT_STATUSTYPE_ocsp 1
 
 /* ECPointFormat values from RFC 4492 */
 #define TLSEXT_ECPOINTFORMAT_uncompressed 0
 #define TLSEXT_ECPOINTFORMAT_ansiX962_compressed_prime 1
-#define TLSEXT_ECPOINTFORMAT_ansiX962_compressed_char2 2
 
 /* Signature and hash algorithms from RFC 5246 */
 
@@ -267,52 +253,7 @@ extern "C" {
 #define TLSEXT_hash_sha384 5
 #define TLSEXT_hash_sha512 6
 
-/* Flag set for unrecognised algorithms */
-#define TLSEXT_nid_unknown 0x1000000
-
-/* ECC curves */
-
-#define TLSEXT_curve_P_256 23
-#define TLSEXT_curve_P_384 24
-
-
 #define TLSEXT_MAXLEN_host_name 255
-
-OPENSSL_EXPORT const char *SSL_get_servername(const SSL *s, const int type);
-OPENSSL_EXPORT int SSL_get_servername_type(const SSL *s);
-
-/* SSL_export_keying_material exports a value derived from the master secret, as
- * specified in RFC 5705. It writes |out_len| bytes to |out| given a label and
- * optional context. (Since a zero length context is allowed, the |use_context|
- * flag controls whether a context is included.)
- *
- * It returns one on success and zero otherwise. */
-OPENSSL_EXPORT int SSL_export_keying_material(
-    SSL *s, uint8_t *out, size_t out_len, const char *label, size_t label_len,
-    const uint8_t *context, size_t context_len, int use_context);
-
-/* SSL_set_tlsext_host_name, for a client, configures |ssl| to advertise |name|
- * in the server_name extension. It returns one on success and zero on error. */
-OPENSSL_EXPORT int SSL_set_tlsext_host_name(SSL *ssl, const char *name);
-
-/* SSL_CTX_set_tlsext_servername_callback configures |callback| to be called on
- * the server after ClientHello extensions have been parsed and returns one.
- * |callback| may use |SSL_get_servername| to examine the server_name extension
- * and return a |SSL_TLSEXT_ERR_*| value. If it returns |SSL_TLSEXT_ERR_NOACK|,
- * the server_name extension is not acknowledged in the ServerHello. If the
- * return value signals an alert, |callback| should set |*out_alert| to the
- * alert to send. */
-OPENSSL_EXPORT int SSL_CTX_set_tlsext_servername_callback(
-    SSL_CTX *ctx, int (*callback)(SSL *ssl, int *out_alert, void *arg));
-
-#define SSL_TLSEXT_ERR_OK 0
-#define SSL_TLSEXT_ERR_ALERT_WARNING 1
-#define SSL_TLSEXT_ERR_ALERT_FATAL 2
-#define SSL_TLSEXT_ERR_NOACK 3
-
-/* SSL_CTX_set_tlsext_servername_arg sets the argument to the servername
- * callback and returns one. See |SSL_CTX_set_tlsext_servername_callback|. */
-OPENSSL_EXPORT int SSL_CTX_set_tlsext_servername_arg(SSL_CTX *ctx, void *arg);
 
 /* PSK ciphersuites from 4279 */
 #define TLS1_CK_PSK_WITH_RC4_128_SHA                    0x0300008A
@@ -471,9 +412,28 @@ OPENSSL_EXPORT int SSL_CTX_set_tlsext_servername_arg(SSL_CTX *ctx, void *arg);
 #define TLS1_CK_ECDH_RSA_WITH_AES_128_GCM_SHA256 0x0300C031
 #define TLS1_CK_ECDH_RSA_WITH_AES_256_GCM_SHA384 0x0300C032
 
-#define TLS1_CK_ECDHE_RSA_CHACHA20_POLY1305 0x0300CC13
-#define TLS1_CK_ECDHE_ECDSA_CHACHA20_POLY1305 0x0300CC14
-#define TLS1_CK_DHE_RSA_CHACHA20_POLY1305 0x0300CC15
+#define TLS1_CK_ECDHE_RSA_CHACHA20_POLY1305_OLD 0x0300CC13
+#define TLS1_CK_ECDHE_ECDSA_CHACHA20_POLY1305_OLD 0x0300CC14
+
+/* ChaCha20-Poly1305 cipher suites from RFC 7905. */
+#define TLS1_CK_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 0x0300CCA8
+#define TLS1_CK_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 0x0300CCA9
+#define TLS1_CK_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 0x0300CCAC
+
+/* PSK ciphersuites from mattsson-tls-ecdhe-psk-aead */
+#define TLS1_CK_ECDHE_PSK_WITH_AES_128_GCM_SHA256 0x0300D001
+#define TLS1_CK_ECDHE_PSK_WITH_AES_256_GCM_SHA384 0x0300D002
+
+/* TODO(davidben): Remove this. Historically, the CK names for CHACHA20_POLY1305
+ * were missing 'WITH' and 'SHA256'. */
+#define TLS1_CK_ECDHE_RSA_CHACHA20_POLY1305 \
+  TLS1_CK_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+
+/* CECPQ1 ciphersuites.  These are specific to BoringSSL and not standard. */
+#define TLS1_CK_CECPQ1_RSA_WITH_CHACHA20_POLY1305_SHA256 0x030016B7
+#define TLS1_CK_CECPQ1_ECDSA_WITH_CHACHA20_POLY1305_SHA256 0x030016B8
+#define TLS1_CK_CECPQ1_RSA_WITH_AES_256_GCM_SHA384 0x030016B9
+#define TLS1_CK_CECPQ1_ECDSA_WITH_AES_256_GCM_SHA384 0x030016BA
 
 /* XXX
  * Inconsistency alert:
@@ -635,10 +595,40 @@ OPENSSL_EXPORT int SSL_CTX_set_tlsext_servername_arg(SSL_CTX *ctx, void *arg);
 #define TLS1_TXT_ECDH_RSA_WITH_AES_128_GCM_SHA256 "ECDH-RSA-AES128-GCM-SHA256"
 #define TLS1_TXT_ECDH_RSA_WITH_AES_256_GCM_SHA384 "ECDH-RSA-AES256-GCM-SHA384"
 
-#define TLS1_TXT_ECDHE_RSA_WITH_CHACHA20_POLY1305 "ECDHE-RSA-CHACHA20-POLY1305"
-#define TLS1_TXT_ECDHE_ECDSA_WITH_CHACHA20_POLY1305 \
+/* For convenience, the old and new CHACHA20_POLY1305 ciphers have the same
+ * name. In cipher strings, both will be selected. This is temporary and will be
+ * removed when the pre-standard construction is removed. */
+#define TLS1_TXT_ECDHE_RSA_WITH_CHACHA20_POLY1305_OLD \
+  "ECDHE-RSA-CHACHA20-POLY1305"
+#define TLS1_TXT_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_OLD \
   "ECDHE-ECDSA-CHACHA20-POLY1305"
-#define TLS1_TXT_DHE_RSA_WITH_CHACHA20_POLY1305 "DHE-RSA-CHACHA20-POLY1305"
+
+#define TLS1_TXT_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 \
+  "ECDHE-RSA-CHACHA20-POLY1305"
+#define TLS1_TXT_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 \
+  "ECDHE-ECDSA-CHACHA20-POLY1305"
+#define TLS1_TXT_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 \
+  "ECDHE-PSK-CHACHA20-POLY1305"
+
+/* TODO(davidben): Remove this. Historically, the TXT names for CHACHA20_POLY1305
+ * were missing 'SHA256'. */
+#define TLS1_TXT_ECDHE_RSA_WITH_CHACHA20_POLY1305 \
+  TLS1_TXT_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+
+/* PSK ciphersuites from mattsson-tls-ecdhe-psk-aead */
+#define TLS1_TXT_ECDHE_PSK_WITH_AES_128_GCM_SHA256 "ECDHE-PSK-AES128-GCM-SHA256"
+#define TLS1_TXT_ECDHE_PSK_WITH_AES_256_GCM_SHA384 "ECDHE-PSK-AES256-GCM-SHA384"
+
+/* CECPQ1 ciphersuites.  These are specific to BoringSSL and not standard. */
+#define TLS1_TXT_CECPQ1_RSA_WITH_CHACHA20_POLY1305_SHA256 \
+  "CECPQ1-RSA-CHACHA20-POLY1305-SHA256"
+#define TLS1_TXT_CECPQ1_ECDSA_WITH_CHACHA20_POLY1305_SHA256 \
+  "CECPQ1-ECDSA-CHACHA20-POLY1305-SHA256"
+#define TLS1_TXT_CECPQ1_RSA_WITH_AES_256_GCM_SHA384 \
+  "CECPQ1-RSA-AES256-GCM-SHA384"
+#define TLS1_TXT_CECPQ1_ECDSA_WITH_AES_256_GCM_SHA384 \
+  "CECPQ1-ECDSA-AES256-GCM-SHA384"
+
 
 #define TLS_CT_RSA_SIGN 1
 #define TLS_CT_DSS_SIGN 2
@@ -668,6 +658,7 @@ OPENSSL_EXPORT int SSL_CTX_set_tlsext_servername_arg(SSL_CTX *ctx, void *arg);
 
 
 #ifdef  __cplusplus
-}
+}  /* extern C */
 #endif
-#endif
+
+#endif  /* OPENSSL_HEADER_TLS1_H */

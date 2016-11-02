@@ -20,6 +20,7 @@
 #include <openssl/err.h>
 
 #include "internal.h"
+#include "../internal.h"
 
 
 size_t EVP_AEAD_key_length(const EVP_AEAD *aead) { return aead->key_len; }
@@ -30,11 +31,15 @@ size_t EVP_AEAD_max_overhead(const EVP_AEAD *aead) { return aead->overhead; }
 
 size_t EVP_AEAD_max_tag_len(const EVP_AEAD *aead) { return aead->max_tag_len; }
 
+void EVP_AEAD_CTX_zero(EVP_AEAD_CTX *ctx) {
+  memset(ctx, 0, sizeof(EVP_AEAD_CTX));
+}
+
 int EVP_AEAD_CTX_init(EVP_AEAD_CTX *ctx, const EVP_AEAD *aead,
                       const uint8_t *key, size_t key_len, size_t tag_len,
                       ENGINE *impl) {
   if (!aead->init) {
-    OPENSSL_PUT_ERROR(CIPHER, EVP_AEAD_CTX_init, CIPHER_R_NO_DIRECTION_SET);
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_NO_DIRECTION_SET);
     ctx->aead = NULL;
     return 0;
   }
@@ -47,8 +52,7 @@ int EVP_AEAD_CTX_init_with_direction(EVP_AEAD_CTX *ctx, const EVP_AEAD *aead,
                                      size_t tag_len,
                                      enum evp_aead_direction_t dir) {
   if (key_len != aead->key_len) {
-    OPENSSL_PUT_ERROR(CIPHER, EVP_AEAD_CTX_init_with_direction,
-                      CIPHER_R_UNSUPPORTED_KEY_SIZE);
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_UNSUPPORTED_KEY_SIZE);
     ctx->aead = NULL;
     return 0;
   }
@@ -77,21 +81,15 @@ void EVP_AEAD_CTX_cleanup(EVP_AEAD_CTX *ctx) {
   ctx->aead = NULL;
 }
 
-/* check_alias returns 0 if |out| points within the buffer determined by |in|
- * and |in_len| and 1 otherwise.
- *
- * When processing, there's only an issue if |out| points within in[:in_len]
- * and isn't equal to |in|. If that's the case then writing the output will
- * stomp input that hasn't been read yet.
- *
- * This function checks for that case. */
-static int check_alias(const uint8_t *in, size_t in_len, const uint8_t *out) {
-  if (out <= in) {
-    return 1;
-  } else if (in + in_len <= out) {
+/* check_alias returns 1 if |out| is compatible with |in| and 0 otherwise. If
+ * |in| and |out| alias, we require that |in| == |out|. */
+static int check_alias(const uint8_t *in, size_t in_len, const uint8_t *out,
+                       size_t out_len) {
+  if (!buffers_alias(in, in_len, out, out_len)) {
     return 1;
   }
-  return 0;
+
+  return in == out;
 }
 
 int EVP_AEAD_CTX_seal(const EVP_AEAD_CTX *ctx, uint8_t *out, size_t *out_len,
@@ -101,12 +99,12 @@ int EVP_AEAD_CTX_seal(const EVP_AEAD_CTX *ctx, uint8_t *out, size_t *out_len,
   size_t possible_out_len = in_len + ctx->aead->overhead;
 
   if (possible_out_len < in_len /* overflow */) {
-    OPENSSL_PUT_ERROR(CIPHER, EVP_AEAD_CTX_seal, CIPHER_R_TOO_LARGE);
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_TOO_LARGE);
     goto error;
   }
 
-  if (!check_alias(in, in_len, out)) {
-    OPENSSL_PUT_ERROR(CIPHER, EVP_AEAD_CTX_seal, CIPHER_R_OUTPUT_ALIASES_INPUT);
+  if (!check_alias(in, in_len, out, max_out_len)) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_OUTPUT_ALIASES_INPUT);
     goto error;
   }
 
@@ -127,8 +125,8 @@ int EVP_AEAD_CTX_open(const EVP_AEAD_CTX *ctx, uint8_t *out, size_t *out_len,
                       size_t max_out_len, const uint8_t *nonce,
                       size_t nonce_len, const uint8_t *in, size_t in_len,
                       const uint8_t *ad, size_t ad_len) {
-  if (!check_alias(in, in_len, out)) {
-    OPENSSL_PUT_ERROR(CIPHER, EVP_AEAD_CTX_open, CIPHER_R_OUTPUT_ALIASES_INPUT);
+  if (!check_alias(in, in_len, out, max_out_len)) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_OUTPUT_ALIASES_INPUT);
     goto error;
   }
 
@@ -152,4 +150,13 @@ int EVP_AEAD_CTX_get_rc4_state(const EVP_AEAD_CTX *ctx, const RC4_KEY **out_key)
   }
 
   return ctx->aead->get_rc4_state(ctx, out_key);
+}
+
+int EVP_AEAD_CTX_get_iv(const EVP_AEAD_CTX *ctx, const uint8_t **out_iv,
+                        size_t *out_len) {
+  if (ctx->aead->get_iv == NULL) {
+    return 0;
+  }
+
+  return ctx->aead->get_iv(ctx, out_iv, out_len);
 }

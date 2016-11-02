@@ -4,7 +4,7 @@
 
 // TLS low level connection and record layer
 
-package main
+package runner
 
 import (
 	"bytes"
@@ -12,6 +12,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -39,6 +40,7 @@ type Conn struct {
 	extendedMasterSecret bool // whether this session used an extended master secret
 	cipherSuite          *cipherSuite
 	ocspResponse         []byte // stapled OCSP response
+	sctList              []byte // signed certificate timestamp list
 	peerCertificates     []*x509.Certificate
 	// verifiedChains contains the certificate chains that we built, as
 	// opposed to the ones presented by the server.
@@ -48,9 +50,15 @@ type Conn struct {
 	// firstFinished contains the first Finished hash sent during the
 	// handshake. This is the "tls-unique" channel binding value.
 	firstFinished [12]byte
+	// peerSignatureAlgorithm contains the signature algorithm that was used
+	// by the peer in the handshake, or zero if not applicable.
+	peerSignatureAlgorithm signatureAlgorithm
+	// curveID contains the curve that was used in the handshake, or zero if
+	// not applicable.
+	curveID CurveID
 
 	clientRandom, serverRandom [32]byte
-	masterSecret               [48]byte
+	exporterSecret             []byte
 
 	clientProtocol         string
 	clientProtocolFallback bool
@@ -72,6 +80,10 @@ type Conn struct {
 	input    *block       // application record waiting to be read
 	hand     bytes.Buffer // handshake record waiting to be read
 
+	// pendingFlight, if PackHandshakeFlight is enabled, is the buffer of
+	// handshake data to be split into records at the end of the flight.
+	pendingFlight bytes.Buffer
+
 	// DTLS state
 	sendHandshakeSeq uint16
 	recvHandshakeSeq uint16
@@ -87,6 +99,8 @@ func (c *Conn) init() {
 	c.out.isDTLS = c.isDTLS
 	c.in.config = c.config
 	c.out.config = c.config
+
+	c.out.updateOutSeq()
 }
 
 // Access to net.Conn methods.
@@ -134,6 +148,7 @@ type halfConn struct {
 	cipher  interface{} // cipher algorithm
 	mac     macFunction
 	seq     [8]byte // 64-bit sequence number
+	outSeq  [8]byte // Mapped sequence number
 	bfree   *block  // list of free blocks
 
 	nextCipher interface{} // next encryption state
@@ -179,7 +194,19 @@ func (hc *halfConn) changeCipherSpec(config *Config) error {
 	hc.nextMac = nil
 	hc.config = config
 	hc.incEpoch()
+
+	if config.Bugs.NullAllCiphers {
+		hc.cipher = nil
+		hc.mac = nil
+	}
 	return nil
+}
+
+// updateKeys sets the current cipher state.
+func (hc *halfConn) updateKeys(cipher interface{}, version uint16) {
+	hc.version = version
+	hc.cipher = cipher
+	hc.incEpoch()
 }
 
 // incSeq increments the sequence number.
@@ -189,10 +216,6 @@ func (hc *halfConn) incSeq(isOutgoing bool) {
 	if hc.isDTLS {
 		// Increment up to the epoch in DTLS.
 		limit = 2
-
-		if isOutgoing && hc.config.Bugs.SequenceNumberIncrement != 0 {
-			increment = hc.config.Bugs.SequenceNumberIncrement
-		}
 	}
 	for i := 7; i >= limit; i-- {
 		increment += uint64(hc.seq[i])
@@ -206,6 +229,8 @@ func (hc *halfConn) incSeq(isOutgoing bool) {
 	if increment != 0 {
 		panic("TLS: sequence number wraparound")
 	}
+
+	hc.updateOutSeq()
 }
 
 // incNextSeq increments the starting sequence number for the next epoch.
@@ -241,6 +266,22 @@ func (hc *halfConn) incEpoch() {
 			hc.seq[i] = 0
 		}
 	}
+
+	hc.updateOutSeq()
+}
+
+func (hc *halfConn) updateOutSeq() {
+	if hc.config.Bugs.SequenceNumberMapping != nil {
+		seqU64 := binary.BigEndian.Uint64(hc.seq[:])
+		seqU64 = hc.config.Bugs.SequenceNumberMapping(seqU64)
+		binary.BigEndian.PutUint64(hc.outSeq[:], seqU64)
+
+		// The DTLS epoch cannot be changed.
+		copy(hc.outSeq[:2], hc.seq[:2])
+		return
+	}
+
+	copy(hc.outSeq[:], hc.seq[:])
 }
 
 func (hc *halfConn) recordHeaderLen() int {
@@ -316,8 +357,9 @@ type cbcMode interface {
 
 // decrypt checks and strips the mac and decrypts the data in b. Returns a
 // success boolean, the number of bytes to skip from the start of the record in
-// order to get the application payload, and an optional alert value.
-func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, alertValue alert) {
+// order to get the application payload, the encrypted record type (or 0
+// if there is none), and an optional alert value.
+func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, contentType recordType, alertValue alert) {
 	recordHeaderLen := hc.recordHeaderLen()
 
 	// pull out payload
@@ -347,22 +389,37 @@ func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, alertValue alert)
 			if c.explicitNonce {
 				explicitIVLen = 8
 				if len(payload) < explicitIVLen {
-					return false, 0, alertBadRecordMAC
+					return false, 0, 0, alertBadRecordMAC
 				}
 				nonce = payload[:8]
 				payload = payload[8:]
 			}
 
-			var additionalData [13]byte
-			copy(additionalData[:], seq)
-			copy(additionalData[8:], b.data[:3])
-			n := len(payload) - c.Overhead()
-			additionalData[11] = byte(n >> 8)
-			additionalData[12] = byte(n)
+			var additionalData []byte
+			if hc.version < VersionTLS13 {
+				additionalData = make([]byte, 13)
+				copy(additionalData, seq)
+				copy(additionalData[8:], b.data[:3])
+				n := len(payload) - c.Overhead()
+				additionalData[11] = byte(n >> 8)
+				additionalData[12] = byte(n)
+			}
 			var err error
-			payload, err = c.Open(payload[:0], nonce, payload, additionalData[:])
+			payload, err = c.Open(payload[:0], nonce, payload, additionalData)
 			if err != nil {
-				return false, 0, alertBadRecordMAC
+				return false, 0, 0, alertBadRecordMAC
+			}
+			if hc.version >= VersionTLS13 {
+				i := len(payload)
+				for i > 0 && payload[i-1] == 0 {
+					i--
+				}
+				payload = payload[:i]
+				if len(payload) == 0 {
+					return false, 0, 0, alertUnexpectedMessage
+				}
+				contentType = recordType(payload[len(payload)-1])
+				payload = payload[:len(payload)-1]
 			}
 			b.resize(recordHeaderLen + explicitIVLen + len(payload))
 		case cbcMode:
@@ -372,7 +429,7 @@ func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, alertValue alert)
 			}
 
 			if len(payload)%blockSize != 0 || len(payload) < roundUp(explicitIVLen+macSize+1, blockSize) {
-				return false, 0, alertBadRecordMAC
+				return false, 0, 0, alertBadRecordMAC
 			}
 
 			if explicitIVLen > 0 {
@@ -397,6 +454,8 @@ func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, alertValue alert)
 			//
 			// However, our behavior matches OpenSSL, so we leak
 			// only as much as they do.
+		case nullCipher:
+			break
 		default:
 			panic("unknown cipher type")
 		}
@@ -405,7 +464,7 @@ func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, alertValue alert)
 	// check, strip mac
 	if hc.mac != nil {
 		if len(payload) < macSize {
-			return false, 0, alertBadRecordMAC
+			return false, 0, 0, alertBadRecordMAC
 		}
 
 		// strip mac off payload, b.data
@@ -417,13 +476,13 @@ func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, alertValue alert)
 		localMAC := hc.mac.MAC(hc.inDigestBuf, seq, b.data[:3], b.data[recordHeaderLen-2:recordHeaderLen], payload[:n])
 
 		if subtle.ConstantTimeCompare(localMAC, remoteMAC) != 1 || paddingGood != 255 {
-			return false, 0, alertBadRecordMAC
+			return false, 0, 0, alertBadRecordMAC
 		}
 		hc.inDigestBuf = localMAC
 	}
 	hc.incSeq(false)
 
-	return true, recordHeaderLen + explicitIVLen, 0
+	return true, recordHeaderLen + explicitIVLen, contentType, 0
 }
 
 // padToBlockSize calculates the needed padding block, if any, for a payload.
@@ -455,12 +514,12 @@ func padToBlockSize(payload []byte, blockSize int, config *Config) (prefix, fina
 }
 
 // encrypt encrypts and macs the data in b.
-func (hc *halfConn) encrypt(b *block, explicitIVLen int) (bool, alert) {
+func (hc *halfConn) encrypt(b *block, explicitIVLen int, typ recordType) (bool, alert) {
 	recordHeaderLen := hc.recordHeaderLen()
 
 	// mac
 	if hc.mac != nil {
-		mac := hc.mac.MAC(hc.outDigestBuf, hc.seq[0:], b.data[:3], b.data[recordHeaderLen-2:recordHeaderLen], b.data[recordHeaderLen+explicitIVLen:])
+		mac := hc.mac.MAC(hc.outDigestBuf, hc.outSeq[0:], b.data[:3], b.data[recordHeaderLen-2:recordHeaderLen], b.data[recordHeaderLen+explicitIVLen:])
 
 		n := len(b.data)
 		b.resize(n + len(mac))
@@ -477,21 +536,41 @@ func (hc *halfConn) encrypt(b *block, explicitIVLen int) (bool, alert) {
 			c.XORKeyStream(payload, payload)
 		case *tlsAead:
 			payloadLen := len(b.data) - recordHeaderLen - explicitIVLen
-			b.resize(len(b.data) + c.Overhead())
-			nonce := hc.seq[:]
+			paddingLen := 0
+			if hc.version >= VersionTLS13 {
+				payloadLen++
+				paddingLen = hc.config.Bugs.RecordPadding
+			}
+			if hc.config.Bugs.OmitRecordContents {
+				payloadLen = 0
+			}
+			b.resize(recordHeaderLen + explicitIVLen + payloadLen + paddingLen + c.Overhead())
+			if hc.version >= VersionTLS13 {
+				if !hc.config.Bugs.OmitRecordContents {
+					b.data[payloadLen+recordHeaderLen-1] = byte(typ)
+				}
+				for i := 0; i < hc.config.Bugs.RecordPadding; i++ {
+					b.data[payloadLen+recordHeaderLen+i] = 0
+				}
+				payloadLen += paddingLen
+			}
+			nonce := hc.outSeq[:]
 			if c.explicitNonce {
 				nonce = b.data[recordHeaderLen : recordHeaderLen+explicitIVLen]
 			}
 			payload := b.data[recordHeaderLen+explicitIVLen:]
 			payload = payload[:payloadLen]
 
-			var additionalData [13]byte
-			copy(additionalData[:], hc.seq[:])
-			copy(additionalData[8:], b.data[:3])
-			additionalData[11] = byte(payloadLen >> 8)
-			additionalData[12] = byte(payloadLen)
+			var additionalData []byte
+			if hc.version < VersionTLS13 {
+				additionalData = make([]byte, 13)
+				copy(additionalData, hc.outSeq[:])
+				copy(additionalData[8:], b.data[:3])
+				additionalData[11] = byte(payloadLen >> 8)
+				additionalData[12] = byte(payloadLen)
+			}
 
-			c.Seal(payload[:0], nonce, payload, additionalData[:])
+			c.Seal(payload[:0], nonce, payload, additionalData)
 		case cbcMode:
 			blockSize := c.BlockSize()
 			if explicitIVLen > 0 {
@@ -502,6 +581,8 @@ func (hc *halfConn) encrypt(b *block, explicitIVLen int) (bool, alert) {
 			b.resize(recordHeaderLen + explicitIVLen + len(prefix) + len(finalBlock))
 			c.CryptBlocks(b.data[recordHeaderLen+explicitIVLen:], prefix)
 			c.CryptBlocks(b.data[recordHeaderLen+explicitIVLen+len(prefix):], finalBlock)
+		case nullCipher:
+			break
 		default:
 			panic("unknown cipher type")
 		}
@@ -630,10 +711,10 @@ func (c *Conn) doReadRecord(want recordType) (recordType, *block, error) {
 	if err := b.readFromUntil(c.conn, recordHeaderLen); err != nil {
 		// RFC suggests that EOF without an alertCloseNotify is
 		// an error, but popular web sites seem to do this,
-		// so we can't make it an error.
-		// if err == io.EOF {
-		// 	err = io.ErrUnexpectedEOF
-		// }
+		// so we can't make it an error, outside of tests.
+		if err == io.EOF && c.config.Bugs.ExpectCloseNotify {
+			err = io.ErrUnexpectedEOF
+		}
 		if e, ok := err.(net.Error); !ok || !e.Temporary() {
 			c.in.setErrorLocked(err)
 		}
@@ -652,15 +733,20 @@ func (c *Conn) doReadRecord(want recordType) (recordType, *block, error) {
 
 	vers := uint16(b.data[1])<<8 | uint16(b.data[2])
 	n := int(b.data[3])<<8 | int(b.data[4])
-	if c.haveVers {
-		if vers != c.vers {
-			c.sendAlert(alertProtocolVersion)
-			return 0, nil, c.in.setErrorLocked(fmt.Errorf("tls: received record with version %x when expecting version %x", vers, c.vers))
-		}
-	} else {
-		if expect := c.config.Bugs.ExpectInitialRecordVersion; expect != 0 && vers != expect {
-			c.sendAlert(alertProtocolVersion)
-			return 0, nil, c.in.setErrorLocked(fmt.Errorf("tls: received record with version %x when expecting version %x", vers, expect))
+	// Alerts sent near version negotiation do not have a well-defined
+	// record-layer version prior to TLS 1.3. (In TLS 1.3, the record-layer
+	// version is irrelevant.)
+	if typ != recordTypeAlert {
+		if c.haveVers {
+			if vers != c.vers && c.vers < VersionTLS13 {
+				c.sendAlert(alertProtocolVersion)
+				return 0, nil, c.in.setErrorLocked(fmt.Errorf("tls: received record with version %x when expecting version %x", vers, c.vers))
+			}
+		} else {
+			if expect := c.config.Bugs.ExpectInitialRecordVersion; expect != 0 && vers != expect {
+				c.sendAlert(alertProtocolVersion)
+				return 0, nil, c.in.setErrorLocked(fmt.Errorf("tls: received record with version %x when expecting version %x", vers, expect))
+			}
 		}
 	}
 	if n > maxCiphertext {
@@ -693,11 +779,18 @@ func (c *Conn) doReadRecord(want recordType) (recordType, *block, error) {
 
 	// Process message.
 	b, c.rawInput = c.in.splitBlock(b, recordHeaderLen+n)
-	ok, off, err := c.in.decrypt(b)
+	ok, off, encTyp, alertValue := c.in.decrypt(b)
 	if !ok {
-		c.in.setErrorLocked(c.sendAlert(err))
+		return 0, nil, c.in.setErrorLocked(c.sendAlert(alertValue))
 	}
 	b.off = off
+
+	if c.vers >= VersionTLS13 && c.in.cipher != nil {
+		if typ != recordTypeApplicationData {
+			return 0, nil, c.in.setErrorLocked(fmt.Errorf("tls: outer record type is not application data"))
+		}
+		typ = encTyp
+	}
 	return typ, b, nil
 }
 
@@ -722,6 +815,10 @@ func (c *Conn) readRecord(want recordType) error {
 			c.sendAlert(alertInternalError)
 			return c.in.setErrorLocked(errors.New("tls: application data record requested before handshake complete"))
 		}
+	case recordTypeAlert:
+		// Looking for a close_notify. Note: unlike a real
+		// implementation, this is not tolerant of additional records.
+		// See the documentation for ExpectCloseNotify.
 	}
 
 Again:
@@ -784,7 +881,7 @@ Again:
 			// A client might need to process a HelloRequest from
 			// the server, thus receiving a handshake message when
 			// application data is expected is ok.
-			if !c.isClient {
+			if !c.isClient || want != recordTypeApplicationData {
 				return c.in.setErrorLocked(c.sendAlert(alertNoRenegotiation))
 			}
 		}
@@ -805,6 +902,9 @@ func (c *Conn) sendAlertLocked(level byte, err alert) error {
 	if c.config.Bugs.FragmentAlert {
 		c.writeRecord(recordTypeAlert, c.tmp[0:1])
 		c.writeRecord(recordTypeAlert, c.tmp[1:2])
+	} else if c.config.Bugs.DoubleAlert {
+		copy(c.tmp[2:4], c.tmp[0:2])
+		c.writeRecord(recordTypeAlert, c.tmp[0:4])
 	} else {
 		c.writeRecord(recordTypeAlert, c.tmp[0:2])
 	}
@@ -819,7 +919,7 @@ func (c *Conn) sendAlertLocked(level byte, err alert) error {
 // L < c.out.Mutex.
 func (c *Conn) sendAlert(err alert) error {
 	level := byte(alertLevelError)
-	if err == alertNoRenegotiation || err == alertCloseNotify {
+	if err == alertNoRenegotiation || err == alertCloseNotify || err == alertNoCertficate {
 		level = alertLevelWarning
 	}
 	return c.SendAlert(level, err)
@@ -844,17 +944,44 @@ func (c *Conn) writeV2Record(data []byte) (n int, err error) {
 // to the connection and updates the record layer state.
 // c.out.Mutex <= L.
 func (c *Conn) writeRecord(typ recordType, data []byte) (n int, err error) {
+	if wrongType := c.config.Bugs.SendWrongMessageType; wrongType != 0 {
+		if typ == recordTypeHandshake && data[0] == wrongType {
+			newData := make([]byte, len(data))
+			copy(newData, data)
+			newData[0] += 42
+			data = newData
+		}
+	}
+
 	if c.isDTLS {
 		return c.dtlsWriteRecord(typ, data)
 	}
 
+	if typ == recordTypeHandshake {
+		if c.config.Bugs.SendHelloRequestBeforeEveryHandshakeMessage {
+			newData := make([]byte, 0, 4+len(data))
+			newData = append(newData, typeHelloRequest, 0, 0, 0)
+			newData = append(newData, data...)
+			data = newData
+		}
+
+		if c.config.Bugs.PackHandshakeFlight {
+			c.pendingFlight.Write(data)
+			return len(data), nil
+		}
+	}
+
+	return c.doWriteRecord(typ, data)
+}
+
+func (c *Conn) doWriteRecord(typ recordType, data []byte) (n int, err error) {
 	recordHeaderLen := tlsRecordHeaderLen
 	b := c.out.newBlock()
 	first := true
 	isClientHello := typ == recordTypeHandshake && len(data) > 0 && data[0] == typeClientHello
 	for len(data) > 0 || first {
 		m := len(data)
-		if m > maxPlaintext {
+		if m > maxPlaintext && !c.config.Bugs.SendLargeRecords {
 			m = maxPlaintext
 		}
 		if typ == recordTypeHandshake && c.config.Bugs.MaxHandshakeRecordLength > 0 && m > c.config.Bugs.MaxHandshakeRecordLength {
@@ -891,10 +1018,19 @@ func (c *Conn) writeRecord(typ recordType, data []byte) (n int, err error) {
 		}
 		b.resize(recordHeaderLen + explicitIVLen + m)
 		b.data[0] = byte(typ)
+		if c.vers >= VersionTLS13 && c.out.cipher != nil {
+			b.data[0] = byte(recordTypeApplicationData)
+			if outerType := c.config.Bugs.OuterRecordType; outerType != 0 {
+				b.data[0] = byte(outerType)
+			}
+		}
 		vers := c.vers
-		if vers == 0 {
+		if vers == 0 || vers >= VersionTLS13 {
 			// Some TLS servers fail if the record version is
 			// greater than TLS 1.0 for the initial ClientHello.
+			//
+			// TLS 1.3 fixes the version number in the record
+			// layer to {3, 1}.
 			vers = VersionTLS10
 		}
 		b.data[1] = byte(vers >> 8)
@@ -912,7 +1048,7 @@ func (c *Conn) writeRecord(typ recordType, data []byte) (n int, err error) {
 			}
 		}
 		copy(b.data[recordHeaderLen+explicitIVLen:], data)
-		c.out.encrypt(b, explicitIVLen)
+		c.out.encrypt(b, explicitIVLen, typ)
 		_, err = c.conn.Write(b.data)
 		if err != nil {
 			break
@@ -934,6 +1070,23 @@ func (c *Conn) writeRecord(typ recordType, data []byte) (n int, err error) {
 		}
 	}
 	return
+}
+
+func (c *Conn) flushHandshake() error {
+	if c.isDTLS {
+		return c.dtlsFlushHandshake()
+	}
+
+	for c.pendingFlight.Len() > 0 {
+		var buf [maxPlaintext]byte
+		n, _ := c.pendingFlight.Read(buf[:])
+		if _, err := c.doWriteRecord(recordTypeHandshake, buf[:n]); err != nil {
+			return err
+		}
+	}
+
+	c.pendingFlight.Reset()
+	return nil
 }
 
 func (c *Conn) doReadHandshake() ([]byte, error) {
@@ -987,13 +1140,20 @@ func (c *Conn) readHandshake() (interface{}, error) {
 		m = &serverHelloMsg{
 			isDTLS: c.isDTLS,
 		}
+	case typeHelloRetryRequest:
+		m = new(helloRetryRequestMsg)
 	case typeNewSessionTicket:
 		m = new(newSessionTicketMsg)
+	case typeEncryptedExtensions:
+		m = new(encryptedExtensionsMsg)
 	case typeCertificate:
-		m = new(certificateMsg)
+		m = &certificateMsg{
+			hasRequestContext: c.vers >= VersionTLS13,
+		}
 	case typeCertificateRequest:
 		m = &certificateRequestMsg{
-			hasSignatureAndHash: c.vers >= VersionTLS12,
+			hasSignatureAlgorithm: c.vers >= VersionTLS12,
+			hasRequestContext:     c.vers >= VersionTLS13,
 		}
 	case typeCertificateStatus:
 		m = new(certificateStatusMsg)
@@ -1005,7 +1165,7 @@ func (c *Conn) readHandshake() (interface{}, error) {
 		m = new(clientKeyExchangeMsg)
 	case typeCertificateVerify:
 		m = &certificateVerifyMsg{
-			hasSignatureAndHash: c.vers >= VersionTLS12,
+			hasSignatureAlgorithm: c.vers >= VersionTLS12,
 		}
 	case typeNextProtocol:
 		m = new(nextProtoMsg)
@@ -1013,8 +1173,8 @@ func (c *Conn) readHandshake() (interface{}, error) {
 		m = new(finishedMsg)
 	case typeHelloVerifyRequest:
 		m = new(helloVerifyRequestMsg)
-	case typeEncryptedExtensions:
-		m = new(encryptedExtensionsMsg)
+	case typeChannelID:
+		m = new(channelIDMsg)
 	default:
 		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
@@ -1034,6 +1194,9 @@ func (c *Conn) readHandshake() (interface{}, error) {
 // sequence number expectations but otherwise ignores them.
 func (c *Conn) skipPacket(packet []byte) error {
 	for len(packet) > 0 {
+		if len(packet) < 13 {
+			return errors.New("tls: bad packet")
+		}
 		// Dropped packets are completely ignored save to update
 		// expected sequence numbers for this and the next epoch. (We
 		// don't assert on the contents of the packets both for
@@ -1043,15 +1206,20 @@ func (c *Conn) skipPacket(packet []byte) error {
 		seq := packet[5:11]
 		length := uint16(packet[11])<<8 | uint16(packet[12])
 		if bytes.Equal(c.in.seq[:2], epoch) {
-			if !bytes.Equal(c.in.seq[2:], seq) {
+			if bytes.Compare(seq, c.in.seq[2:]) < 0 {
 				return errors.New("tls: sequence mismatch")
 			}
+			copy(c.in.seq[2:], seq)
 			c.in.incSeq(false)
 		} else {
-			if !bytes.Equal(c.in.nextSeq[:], seq) {
+			if bytes.Compare(seq, c.in.nextSeq[:]) < 0 {
 				return errors.New("tls: sequence mismatch")
 			}
+			copy(c.in.nextSeq[:], seq)
 			c.in.incNextSeq()
+		}
+		if len(packet) < 13+int(length) {
+			return errors.New("tls: bad packet")
 		}
 		packet = packet[13+length:]
 	}
@@ -1112,6 +1280,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 		c.sendAlertLocked(alertLevelError, c.config.Bugs.SendSpuriousAlert)
 	}
 
+	if c.config.Bugs.SendHelloRequestBeforeEveryAppDataRecord {
+		c.writeRecord(recordTypeHandshake, []byte{typeHelloRequest, 0, 0, 0})
+		c.flushHandshake()
+	}
+
 	// SSL 3.0 and TLS 1.0 are susceptible to a chosen-plaintext
 	// attack when using block mode ciphers due to predictable IVs.
 	// This can be prevented by splitting each Application Data
@@ -1157,8 +1330,12 @@ func (c *Conn) handleRenegotiation() error {
 
 func (c *Conn) Renegotiate() error {
 	if !c.isClient {
-		helloReq := new(helloRequestMsg)
-		c.writeRecord(recordTypeHandshake, helloReq.marshal())
+		helloReq := new(helloRequestMsg).marshal()
+		if c.config.Bugs.BadHelloRequest != nil {
+			helloReq = c.config.Bugs.BadHelloRequest
+		}
+		c.writeRecord(recordTypeHandshake, helloReq)
+		c.flushHandshake()
 	}
 
 	c.handshakeComplete = false
@@ -1236,8 +1413,29 @@ func (c *Conn) Close() error {
 
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
-	if c.handshakeComplete {
-		alertErr = c.sendAlert(alertCloseNotify)
+	if c.handshakeComplete && !c.config.Bugs.NoCloseNotify {
+		alert := alertCloseNotify
+		if c.config.Bugs.SendAlertOnShutdown != 0 {
+			alert = c.config.Bugs.SendAlertOnShutdown
+		}
+		alertErr = c.sendAlert(alert)
+		// Clear local alerts when sending alerts so we continue to wait
+		// for the peer rather than closing the socket early.
+		if opErr, ok := alertErr.(*net.OpError); ok && opErr.Op == "local error" {
+			alertErr = nil
+		}
+	}
+
+	// Consume a close_notify from the peer if one hasn't been received
+	// already. This avoids the peer from failing |SSL_shutdown| due to a
+	// write failing.
+	if c.handshakeComplete && alertErr == nil && c.config.Bugs.ExpectCloseNotify {
+		for c.in.error() == nil {
+			c.readRecord(recordTypeAlert)
+		}
+		if c.in.error() != io.EOF {
+			alertErr = c.in.error()
+		}
 	}
 
 	if err := c.conn.Close(); err != nil {
@@ -1268,6 +1466,9 @@ func (c *Conn) Handshake() error {
 			0x0, 0x2, // length
 		})
 		c.conn.Write([]byte{alertLevelError, byte(alertInternalError)})
+	}
+	if data := c.config.Bugs.AppDataBeforeHandshake; data != nil {
+		c.writeRecord(recordTypeApplicationData, data)
 	}
 	if c.isClient {
 		c.handshakeErr = c.clientHandshake()
@@ -1300,6 +1501,9 @@ func (c *Conn) ConnectionState() ConnectionState {
 		state.ChannelID = c.channelID
 		state.SRTPProtectionProfile = c.srtpProtectionProfile
 		state.TLSUnique = c.firstFinished[:]
+		state.SCTList = c.sctList
+		state.PeerSignatureAlgorithm = c.peerSignatureAlgorithm
+		state.CurveID = c.curveID
 	}
 
 	return state
@@ -1338,6 +1542,12 @@ func (c *Conn) ExportKeyingMaterial(length int, label, context []byte, useContex
 		return nil, errors.New("tls: handshake has not yet been performed")
 	}
 
+	if c.vers >= VersionTLS13 {
+		// TODO(davidben): What should we do with useContext? See
+		// https://github.com/tlswg/tls13-spec/issues/546
+		return hkdfExpandLabel(c.cipherSuite.hash(), c.exporterSecret, label, context, length), nil
+	}
+
 	seedLen := len(c.clientRandom) + len(c.serverRandom)
 	if useContext {
 		seedLen += 2 + len(context)
@@ -1350,6 +1560,21 @@ func (c *Conn) ExportKeyingMaterial(length int, label, context []byte, useContex
 		seed = append(seed, context...)
 	}
 	result := make([]byte, length)
-	prfForVersion(c.vers, c.cipherSuite)(result, c.masterSecret[:], label, seed)
+	prfForVersion(c.vers, c.cipherSuite)(result, c.exporterSecret, label, seed)
 	return result, nil
+}
+
+// noRenegotiationInfo returns true if the renegotiation info extension
+// should be supported in the current handshake.
+func (c *Conn) noRenegotiationInfo() bool {
+	if c.config.Bugs.NoRenegotiationInfo {
+		return true
+	}
+	if c.cipherSuite == nil && c.config.Bugs.NoRenegotiationInfoInInitial {
+		return true
+	}
+	if c.cipherSuite != nil && c.config.Bugs.NoRenegotiationInfoAfterInitial {
+		return true
+	}
+	return false
 }

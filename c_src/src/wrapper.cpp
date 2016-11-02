@@ -3,7 +3,7 @@
  * @author Konrad Zemek
  * @copyright (C) 2015 ACK CYFRONET AGH
  * @copyright This software is released under the MIT license cited in
- * 'LICENSE.txt'
+ * 'LICENSE.md'
  */
 
 #include "callback.hpp"
@@ -19,8 +19,8 @@
 #include <string>
 #include <system_error>
 #include <tuple>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 using namespace std::literals;
 
@@ -528,6 +528,8 @@ static ErlNifFunc nif_funcs[] = {{"connect", 12, connect_nif},
     {"certificate_chain", 1, certificate_chain_nif},
     {"shutdown", 3, shutdown_nif}};
 
-ERL_NIF_INIT(ssl2_nif, nif_funcs, load, NULL, NULL, NULL)
+#pragma GCC visibility push(default)
+ERL_NIF_INIT(etls_nif, nif_funcs, load, NULL, NULL, NULL)
+#pragma GCC visibility pop
 
 } // extern C

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package main
+package runner
 
 import "strconv"
 
@@ -16,12 +16,14 @@ const (
 
 const (
 	alertCloseNotify            alert = 0
+	alertEndOfEarlyData         alert = 1
 	alertUnexpectedMessage      alert = 10
 	alertBadRecordMAC           alert = 20
 	alertDecryptionFailed       alert = 21
 	alertRecordOverflow         alert = 22
 	alertDecompressionFailure   alert = 30
 	alertHandshakeFailure       alert = 40
+	alertNoCertficate           alert = 41
 	alertBadCertificate         alert = 42
 	alertUnsupportedCertificate alert = 43
 	alertCertificateRevoked     alert = 44
@@ -37,10 +39,13 @@ const (
 	alertInternalError          alert = 80
 	alertUserCanceled           alert = 90
 	alertNoRenegotiation        alert = 100
+	alertMissingExtension       alert = 109
+	alertUnsupportedExtension   alert = 110
 )
 
 var alertText = map[alert]string{
 	alertCloseNotify:            "close notify",
+	alertEndOfEarlyData:         "end of early data",
 	alertUnexpectedMessage:      "unexpected message",
 	alertBadRecordMAC:           "bad record MAC",
 	alertDecryptionFailed:       "decryption failed",
@@ -62,6 +67,8 @@ var alertText = map[alert]string{
 	alertInternalError:          "internal error",
 	alertUserCanceled:           "user canceled",
 	alertNoRenegotiation:        "no renegotiation",
+	alertMissingExtension:       "missing extension",
+	alertUnsupportedExtension:   "unsupported extension",
 }
 
 func (e alert) String() string {

@@ -14,6 +14,8 @@
 
 #include <openssl/base.h>
 
+#include <stdio.h>
+
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -73,6 +75,21 @@ static const struct argument kArguments[] = {
      "-false-start", kBooleanArgument,
      "Enable False Start",
     },
+    { "-session-in", kOptionalArgument,
+      "A file containing a session to resume.",
+    },
+    { "-session-out", kOptionalArgument,
+      "A file to write the negotiated session to.",
+    },
+    {
+      "-key", kOptionalArgument,
+      "Private-key file to use (default is no client certificate)",
+    },
+    {
+      "-starttls", kOptionalArgument,
+      "A STARTTLS mini-protocol to run before the TLS handshake. Supported"
+      " values: 'smtp'",
+    },
     {
      "", kOptionalArgument, "",
     },
@@ -88,29 +105,18 @@ static ScopedEVP_PKEY LoadPrivateKey(const std::string &file) {
   return pkey;
 }
 
-static bool VersionFromString(uint16_t *out_version,
-                              const std::string& version) {
-  if (version == "ssl3") {
-    *out_version = SSL3_VERSION;
-    return true;
-  } else if (version == "tls1" || version == "tls1.0") {
-    *out_version = TLS1_VERSION;
-    return true;
-  } else if (version == "tls1.1") {
-    *out_version = TLS1_1_VERSION;
-    return true;
-  } else if (version == "tls1.2") {
-    *out_version = TLS1_2_VERSION;
-    return true;
-  }
-  return false;
-}
-
 static int NextProtoSelectCallback(SSL* ssl, uint8_t** out, uint8_t* outlen,
                                    const uint8_t* in, unsigned inlen, void* arg) {
   *out = reinterpret_cast<uint8_t *>(arg);
   *outlen = strlen(reinterpret_cast<const char *>(arg));
   return SSL_TLSEXT_ERR_OK;
+}
+
+static FILE *g_keylog_file = nullptr;
+
+static void KeyLogCallback(const SSL *ssl, const char *line) {
+  fprintf(g_keylog_file, "%s\n", line);
+  fflush(g_keylog_file);
 }
 
 bool Client(const std::vector<std::string> &args) {
@@ -129,12 +135,12 @@ bool Client(const std::vector<std::string> &args) {
 
   const char *keylog_file = getenv("SSLKEYLOGFILE");
   if (keylog_file) {
-    BIO *keylog_bio = BIO_new_file(keylog_file, "a");
-    if (!keylog_bio) {
-      ERR_print_errors_cb(PrintErrorCallback, stderr);
+    g_keylog_file = fopen(keylog_file, "a");
+    if (g_keylog_file == nullptr) {
+      perror("fopen");
       return false;
     }
-    SSL_CTX_set_keylog_bio(ctx.get(), keylog_bio);
+    SSL_CTX_set_keylog_callback(ctx.get(), KeyLogCallback);
   }
 
   if (args_map.count("-cipher") != 0 &&
@@ -215,11 +221,22 @@ bool Client(const std::vector<std::string> &args) {
     if (!pkey || !SSL_CTX_set1_tls_channel_id(ctx.get(), pkey.get())) {
       return false;
     }
-    ctx->tlsext_channel_id_enabled_new = 1;
   }
 
   if (args_map.count("-false-start") != 0) {
     SSL_CTX_set_mode(ctx.get(), SSL_MODE_ENABLE_FALSE_START);
+  }
+
+  if (args_map.count("-key") != 0) {
+    const std::string &key = args_map["-key"];
+    if (!SSL_CTX_use_PrivateKey_file(ctx.get(), key.c_str(), SSL_FILETYPE_PEM)) {
+      fprintf(stderr, "Failed to load private key: %s\n", key.c_str());
+      return false;
+    }
+    if (!SSL_CTX_use_certificate_chain_file(ctx.get(), key.c_str())) {
+      fprintf(stderr, "Failed to load cert chain: %s\n", key.c_str());
+      return false;
+    }
   }
 
   int sock = -1;
@@ -227,11 +244,40 @@ bool Client(const std::vector<std::string> &args) {
     return false;
   }
 
+  if (args_map.count("-starttls") != 0) {
+    const std::string& starttls = args_map["-starttls"];
+    if (starttls == "smtp") {
+      if (!DoSMTPStartTLS(sock)) {
+        return false;
+      }
+    } else {
+      fprintf(stderr, "Unknown value for -starttls: %s\n", starttls.c_str());
+      return false;
+    }
+  }
+
   ScopedBIO bio(BIO_new_socket(sock, BIO_CLOSE));
   ScopedSSL ssl(SSL_new(ctx.get()));
 
   if (args_map.count("-server-name") != 0) {
     SSL_set_tlsext_host_name(ssl.get(), args_map["-server-name"].c_str());
+  }
+
+  if (args_map.count("-session-in") != 0) {
+    ScopedBIO in(BIO_new_file(args_map["-session-in"].c_str(), "rb"));
+    if (!in) {
+      fprintf(stderr, "Error reading session\n");
+      ERR_print_errors_cb(PrintErrorCallback, stderr);
+      return false;
+    }
+    ScopedSSL_SESSION session(PEM_read_bio_SSL_SESSION(in.get(), nullptr,
+                                                       nullptr, nullptr));
+    if (!session) {
+      fprintf(stderr, "Error reading session\n");
+      ERR_print_errors_cb(PrintErrorCallback, stderr);
+      return false;
+    }
+    SSL_set_session(ssl.get(), session.get());
   }
 
   SSL_set_bio(ssl.get(), bio.get(), bio.get());
@@ -247,6 +293,16 @@ bool Client(const std::vector<std::string> &args) {
 
   fprintf(stderr, "Connected.\n");
   PrintConnectionInfo(ssl.get());
+
+  if (args_map.count("-session-out") != 0) {
+    ScopedBIO out(BIO_new_file(args_map["-session-out"].c_str(), "wb"));
+    if (!out ||
+        !PEM_write_bio_SSL_SESSION(out.get(), SSL_get0_session(ssl.get()))) {
+      fprintf(stderr, "Error while saving session:\n");
+      ERR_print_errors_cb(PrintErrorCallback, stderr);
+      return false;
+    }
+  }
 
   bool ok = TransferData(ssl.get(), sock);
 

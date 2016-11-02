@@ -12,6 +12,7 @@
  * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 
+#undef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200112L
 
 #include <openssl/bio.h>
@@ -25,10 +26,10 @@
 #include <netdb.h>
 #include <unistd.h>
 #else
-#pragma warning(push, 3)
+OPENSSL_MSVC_PRAGMA(warning(push, 3))
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#pragma warning(pop)
+OPENSSL_MSVC_PRAGMA(warning(pop))
 #endif
 
 #include "internal.h"
@@ -50,7 +51,7 @@ int bio_ip_and_port_to_socket_and_addr(int *out_sock,
 
   ret = getaddrinfo(hostname, port_str, &hint, &result);
   if (ret != 0) {
-    OPENSSL_PUT_ERROR(SYS, getaddrinfo, 0);
+    OPENSSL_PUT_ERROR(SYS, 0);
     ERR_add_error_data(1, gai_strerror(ret));
     return 0;
   }
@@ -58,7 +59,7 @@ int bio_ip_and_port_to_socket_and_addr(int *out_sock,
   ret = 0;
 
   for (cur = result; cur; cur = cur->ai_next) {
-    if (cur->ai_addrlen > sizeof(struct sockaddr_storage)) {
+    if ((size_t) cur->ai_addrlen > sizeof(struct sockaddr_storage)) {
       continue;
     }
     memset(out_addr, 0, sizeof(struct sockaddr_storage));
@@ -67,7 +68,7 @@ int bio_ip_and_port_to_socket_and_addr(int *out_sock,
 
     *out_sock = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
     if (*out_sock < 0) {
-      OPENSSL_PUT_SYSTEM_ERROR(socket);
+      OPENSSL_PUT_SYSTEM_ERROR();
       goto out;
     }
 

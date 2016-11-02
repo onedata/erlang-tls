@@ -38,8 +38,8 @@
 # Add ARMv8 code path performing at 2.0 cpb on Apple A7.
 
 $flavour = shift;
-if ($flavour=~/^\w[\w\-]*\.\w+$/) { $output=$flavour; undef $flavour; }
-else { while (($output=shift) && ($output!~/^\w[\w\-]*\.\w+$/)) {} }
+if ($flavour=~/\w[\w\-]*\.\w+$/) { $output=$flavour; undef $flavour; }
+else { while (($output=shift) && ($output!~/\w[\w\-]*\.\w+$/)) {} }
 
 if ($flavour && $flavour ne "void") {
     $0 =~ m/(.*[\/\\])[^\/\\]+$/; $dir=$1;
@@ -168,7 +168,7 @@ ___
 
 $code=<<___;
 #ifndef __KERNEL__
-# include "arm_arch.h"
+# include <openssl/arm_arch.h>
 #else
 # define __ARM_ARCH__ __LINUX_ARM_ARCH__
 # define __ARM_MAX_ARCH__ 7
